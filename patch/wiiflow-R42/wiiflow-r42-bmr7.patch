@@ -1,0 +1,8869 @@
+diff -ruwN wiiflow-r42/Makefile wiiflow-r42-book-mod-r7/Makefile
+--- wiiflow-r42/Makefile	Wed Mar 31 05:01:51 2010
++++ wiiflow-r42-book-mod-r7/Makefile	Wed Mar 31 09:22:32 2010
+@@ -55,7 +55,7 @@
+ #---------------------------------------------------------------------------------
+ # any extra libraries we wish to link with the project
+ #---------------------------------------------------------------------------------
+-LIBS	:=  -ltremor -lfreetype -lwiiuse -lbte -lasnd -lpng -lz -logc -lm -lmad
++LIBS	:=  -ltremor -lfreetype -lwiiuse -lbte -lasnd -lpng -lz -logc -lm -lmad -lwiikeyboard
+ 
+ #---------------------------------------------------------------------------------
+ # list of directories containing libraries, this must be the top level containing
+diff -ruwN wiiflow-r42/source/cheats/cheat.cpp wiiflow-r42-book-mod-r7/source/cheats/cheat.cpp
+--- wiiflow-r42/source/cheats/cheat.cpp	Wed Mar 17 06:20:06 2010
++++ wiiflow-r42-book-mod-r7/source/cheats/cheat.cpp	Mon Apr  5 03:36:19 2010
+@@ -68,7 +68,7 @@
+ 		WPAD_ScanPads();
+ 		padsState = WPAD_ButtonsDown(0);
+ 		wd = WPAD_Data(0);
+-		btn = _btnRepeat(wd->btns_h);
++		more_input_scan(padsState, btn);
+ 		if ((padsState & (WPAD_BUTTON_HOME | WPAD_BUTTON_B)) != 0)
+ 			break;
+ 		if (wd->ir.valid)
+diff -ruwN wiiflow-r42/source/loader/alt_ios.c wiiflow-r42-book-mod-r7/source/loader/alt_ios.c
+--- wiiflow-r42/source/loader/alt_ios.c	Wed Mar 31 05:01:51 2010
++++ wiiflow-r42-book-mod-r7/source/loader/alt_ios.c	Mon Apr  5 01:18:56 2010
+@@ -19,6 +19,7 @@
+ 
+ #include <malloc.h>
+ #include <wiiuse/wpad.h>
++#include <wiikeyboard/keyboard.h>
+ 
+ #include "alt_ios_gen.h"
+ 
+@@ -145,6 +146,8 @@
+ 		Disc_Init();
+ 		WPAD_Init();
+ 		WPAD_SetDataFormat(0, WPAD_FMT_BTNS_ACC_IR);
++		PAD_Init();
++		KEYBOARD_Init(NULL);
+ 	}
+ 	return iosOK;
+ }
+diff -ruwN wiiflow-r42/source/loader/apploader.c wiiflow-r42-book-mod-r7/source/loader/apploader.c
+--- wiiflow-r42/source/loader/apploader.c	Wed Mar 17 06:20:06 2010
++++ wiiflow-r42-book-mod-r7/source/loader/apploader.c	Mon Apr 19 02:59:02 2010
+@@ -42,6 +42,8 @@
+ static void maindolpatches(void *dst, int len, bool cheat, u8 vidMode, GXRModeObj *vmode, bool vipatch, bool countryString, bool err002fix, u8 patchVidModes);
+ static bool Remove_001_Protection(void *Address, int Size);
+ static void Anti_002_fix(void *Address, int Size);
++bool PatchReturnTo(void *Address, int Size, u32 id);
++extern u32 GetReturnTo(void);
+ 
+ static void __noprint(const char *fmt, ...)
+ {
+@@ -88,11 +90,15 @@
+ 	/* Initialize apploader */
+ 	appldr_init(__noprint);
+ 
++    u32 dolStart = 0x90000000;
++    u32 dolEnd = 0x0;
+ 	while (appldr_main(&dst, &len, &offset))
+ 	{
+ 		/* Read data from DVD */
+ 		WDVD_Read(dst, len, (u64)(offset << 2));
+ 		maindolpatches(dst, len, cheat, vidMode, vmode, vipatch, countryString, error002Fix, patchVidModes);
++		if( (u32)dst < dolStart )dolStart = (u32)dst;
++		if( (u32)dst + len > dolEnd ) dolEnd = (u32)dst + len;
+ 	}
+ 	WDVD_Close();
+ 
+@@ -119,8 +125,19 @@
+ 		*entry = altEntry;
+ 	}
+ 	else
++	{
++		u32 rtrn = GetReturnTo();
++	    if( rtrn )
++	    {
++	        if( PatchReturnTo( (u32*)dolStart, dolEnd - dolStart , rtrn) )
++	        {
++	            //gprintf("return-to patched\n" );
++	            DCFlushRange( (u32*)dolStart, dolEnd - dolStart );
++	        }
++	    }	
+ 		/* Set entry point from apploader */
+ 		*entry = appldr_final();
++	}
+ 
+ 	/* ERROR 002 fix (WiiPower) */
+ 	if (error002Fix)
+@@ -327,3 +344,137 @@
+ 		Addr += 4;
+ 	}
+ }
++
++//giantpune's magic super patch to return to channels
++bool PatchReturnTo(void *Address, int Size, u32 id) {
++    if( !id )return 0;
++    //new __OSLoadMenu() (SM2.0 and higher)
++    u8 SearchPattern[ 12 ] =    { 0x38, 0x80, 0x00, 0x02, 0x38, 0x60, 0x00, 0x01, 0x38, 0xa0, 0x00, 0x00 };
++
++    //old _OSLoadMenu() (used in launch games)
++    u8 SearchPatternB[ 12 ] =   { 0x38, 0xC0, 0x00, 0x02, 0x38, 0xA0, 0x00, 0x01, 0x38, 0xE0, 0x00, 0x00 };
++
++    //identifier for the safe place
++    u8 SearchPattern2[ 12 ] =   { 0x4D, 0x65, 0x74, 0x72, 0x6F, 0x77, 0x65, 0x72, 0x6B, 0x73, 0x20, 0x54 };
++
++
++    int found = 0;
++    int patched = 0;
++    u8 oldSDK = 0;
++    u32 ad[ 4 ] = { 0, 0, 0, 0 };
++
++    void *Addr = Address;
++    void *Addr_end = Address+Size;
++
++    while (Addr <= Addr_end - 12 ) {
++        //find a safe place or the patch to hang out
++        if ( ! ad[ 3 ] && memcmp( Addr, SearchPattern2, 12 )==0 ) {
++            ad[ 3 ] = (u32)Addr + 0x30;
++            gprintf("found a safe place @ %08x\n", ad[ 3 ]);
++            //hexdump( Addr, 0x50 );
++        }
++        //find __OSLaunchMenu() and remember some addresses in it
++        else if ( memcmp( Addr, SearchPattern, 12 )==0 ) {
++            ad[ found++ ] = (u32)Addr;
++        }
++        else if ( ad[ 0 ] && memcmp( Addr, SearchPattern, 8 )==0 ) //after the first match is found, only search the first 8 bytes for the other 2
++        {
++            if( !ad[ 1 ] ) ad[ found++ ] = (u32)Addr;
++            else if( !ad[ 2 ] ) ad[ found++ ] = (u32)Addr;
++            if( found >= 3 )break;
++        }
++        Addr += 4;
++    }
++    //check for the older-ass version of the SDK
++    if( found < 3 && ad[ 3 ] )
++    {
++        Addr = Address;
++        ad[ 0 ] = 0; ad[ 1 ] = 0;
++        ad[ 2 ] = 0;
++        found = 0;
++        oldSDK = 1;
++
++        while (Addr <= Addr_end - 12 ) {
++            //find __OSLaunchMenu() and remember some addresses in it
++            if ( memcmp( Addr, SearchPatternB, 12 )==0 ) {
++                ad[ found++ ] = (u32)Addr;
++            }
++            else if ( ad[ 0 ] && memcmp( Addr, SearchPatternB, 8 ) == 0 ) //after the first match is found, only search the first 8 bytes for the other 2
++            {
++                if( !ad[ 1 ] ) ad[ found++ ] = (u32)Addr;
++                else if( !ad[ 2 ] ) ad[ found++ ] = (u32)Addr;
++                if( found >= 3 )break;
++            }
++            Addr += 4;
++        }
++    }
++
++    //if the function is found and if it is not too far into the main.dol
++    if( found == 3 && ( ad[ 2 ] - ad[ 3 ] < 0x1000001 ) && ad[ 3 ] )
++    {
++        gprintf("patch __OSLaunchMenu( 0x00010001, 0x%08x )\n", id);
++        u32 nop = 0x60000000;
++
++        //the magic that writes the TID to the registers
++        u8 jump[ 20 ] = { 0x3C, 0x60, 0x00, 0x01, 0x60, 0x63, 0x00, 0x01,
++                          0x3C, 0x80, 0x4A, 0x4F, 0x60, 0x84, 0x44, 0x49,
++                          0x4E, 0x80, 0x00, 0x20 };
++        if( oldSDK )
++        {
++            jump[ 1 ] = 0xA0; //3CA00001 60A50001
++            jump[ 5 ] = 0xA5; //3CC04A4F 60C64449
++            jump[ 9 ] = 0xC0;
++            jump[ 13 ] = 0xC6;
++        }
++        //patch the thing to use the new TID
++        jump[ 10 ] = (u8)( id >> 24 );
++        jump[ 11 ] = (u8)( id >> 16 );
++        jump[ 14 ] = (u8)( id >> 8 );
++        jump[ 15 ] = (u8)id;
++
++        void* addr = (u32*)ad[ 3 ];
++
++        //write new stuff to memory main.dol in a unused part of the main.dol
++        memcpy( addr, jump, sizeof( jump ) );
++
++        //ES_GetTicketViews()
++        u32 newval = ( ad[ 3 ] - ad[ 0 ] );
++        newval &= 0x03FFFFFC;
++        newval |= 0x48000001;
++        addr = (u32*)ad[ 0 ];
++        memcpy( addr, &newval, sizeof( u32 ) );
++        memcpy( addr + 4, &nop, sizeof( u32 ) );
++        gprintf("\t%p -> %08x\n", addr, newval );
++
++        //ES_GetTicketViews() again
++        newval = ( ad[ 3 ] - ad[ 1 ] );
++        newval &= 0x03FFFFFC;
++        newval |= 0x48000001;
++        addr = (u32*)ad[ 1 ];
++        memcpy( addr, &newval, sizeof( u32 ) );
++        memcpy( addr + 4, &nop, sizeof( u32 ) );
++        gprintf("\t%p -> %08x\n", addr, newval );
++
++        //ES_LaunchTitle()
++        newval = ( ad[ 3 ] - ad[ 2 ] );
++        newval &= 0x03FFFFFC;
++        newval |= 0x48000001;
++        addr = (u32*)ad[ 2 ];
++        memcpy( addr, &newval, sizeof( u32 ) );
++        memcpy( addr + 4, &nop, sizeof( u32 ) );
++        gprintf("\t%p -> %08x\n", addr, newval );
++
++        patched = 1;
++    }
++    else
++    {
++        gprintf("not patched\n");
++        gprintf("found %d addresses\n", found);
++        int i;
++        for( i = 0; i< 4; i++)
++            gprintf("ad[ %d ]: %08x\n", i, ad[ i ] );
++        gprintf("offset : %08x\n", ad[ 2 ] - ad[ 3 ] );
++
++    }
++    return patched;
++}
+diff -ruwN wiiflow-r42/source/loader/load_dol.c wiiflow-r42-book-mod-r7/source/loader/load_dol.c
+--- wiiflow-r42/source/loader/load_dol.c	Tue Oct  6 16:11:48 2009
++++ wiiflow-r42-book-mod-r7/source/loader/load_dol.c	Mon Apr 19 02:58:16 2010
+@@ -24,6 +24,9 @@
+ #include <gccore.h>
+ #include <ogcsys.h>
+ 
++extern bool PatchReturnTo(void *Address, int Size, u32 id);
++extern u32 GetReturnTo(void);
++
+ typedef struct _dolheader
+ {
+ 	u32 section_pos[18];
+@@ -38,6 +41,8 @@
+ {
+ 	int i;
+ 	const dolheader *dol_header;
++	u32 dolStart = 0x90000000;
++	u32 dolEnd = 0x0;
+ 
+ 	dol_header = (dolheader *)dol_data;
+ 	if (dol_header->bss_start != 0)
+@@ -52,8 +57,21 @@
+ 		if (i >= 7)
+ 			DCFlushRangeNoSync((void *)dol_header->section_start[i], dol_header->section_size[i]);
+ 		f((void *)dol_header->section_start[i], dol_header->section_size[i], userData);	// shouldn't be called for data sections, i guess ?
++		if( dol_header->section_start[i] < dolStart ) dolStart = dol_header->section_start[i];
++		if( dol_header->section_start[i] + dol_header->section_size[i] > dolEnd ) dolEnd = dol_header->section_start[i] + dol_header->section_size[i];
+ 	}
+ 	if (dol_header->bss_start != 0)
+ 		DCFlushRange((void *)dol_header->bss_start, dol_header->bss_size);
++
++	u32 rtrn = GetReturnTo();
++    if( rtrn )
++    {
++        if( PatchReturnTo( (u32*)dolStart, dolEnd - dolStart , rtrn) )
++        {
++            //gprintf("return-to patched\n" );
++            DCFlushRange( (u32*)dolStart, dolEnd - dolStart );
++        }
++    }	
++	
+ 	return dol_header->entry_point;
+ }
+diff -ruwN wiiflow-r42/source/loader/wbfs.c wiiflow-r42-book-mod-r7/source/loader/wbfs.c
+--- wiiflow-r42/source/loader/wbfs.c	Wed Mar 31 05:01:51 2010
++++ wiiflow-r42-book-mod-r7/source/loader/wbfs.c	Wed Mar 31 08:38:20 2010
+@@ -725,6 +725,7 @@
+ 			case FS_TYPE_WBFS: snprintf(buf, 6, "WBFS%d", plist.pinfo[index].wbfs_i); break;
+ 			case FS_TYPE_NTFS: snprintf(buf, 6, "NTFS%d", plist.pinfo[index].ntfs_i); break;
+ 			case FS_TYPE_FAT32: snprintf(buf, 6, "FAT%d", plist.pinfo[index].fat_i); break;
++			case FS_TYPE_FAT16: snprintf(buf, 6, "FAT%d", plist.pinfo[index].fat_i); break;
+ 			default: return -1;
+ 		}
+ 	} else {
+diff -ruwN wiiflow-r42/source/main.cpp wiiflow-r42-book-mod-r7/source/main.cpp
+--- wiiflow-r42/source/main.cpp	Wed Mar 31 05:01:51 2010
++++ wiiflow-r42-book-mod-r7/source/main.cpp	Tue Apr 20 22:00:24 2010
+@@ -1,5 +1,6 @@
+ 
+ #include <wiiuse/wpad.h>
++#include <wiikeyboard/keyboard.h>
+ #include "video.hpp"
+ #include "menu/menu.hpp"
+ #include "loader/disc.h"
+@@ -124,6 +125,8 @@
+ 	texWaitHDD.data.release();
+ 	WPAD_Init();
+ 	WPAD_SetDataFormat(0, WPAD_FMT_BTNS_ACC_IR);
++	PAD_Init();
++	KEYBOARD_Init(NULL);
+ 	MEM2_takeBigOnes(true);
+ 	do
+ 	{
+@@ -149,6 +152,6 @@
+ 
+ int main(int argc, char **argv)
+ {
+-	Sys_Exit(old_main(argc, argv));
++	Sys_Exit(Exit_task(old_main(argc, argv)));
+ 	return 0;
+ }
+diff -ruwN wiiflow-r42/source/menu/menu.cpp wiiflow-r42-book-mod-r7/source/menu/menu.cpp
+--- wiiflow-r42/source/menu/menu.cpp	Thu Mar 18 19:10:57 2010
++++ wiiflow-r42-book-mod-r7/source/menu/menu.cpp	Wed Apr 21 00:01:14 2010
+@@ -12,6 +12,7 @@
+ #include <fstream>
+ #include <dirent.h>
+ #include <mp3player.h>
++#include <ctime>
+ 
+ #include "gecko.h"
+ 
+@@ -255,7 +256,14 @@
+ 	SSoundEffect cfCancelSnd;
+ 
+ 	m_cf.setCachePath(m_cacheDir.c_str(), !m_cfg.getBool(" GENERAL", "keep_png", true), m_cfg.getBool(" GENERAL", "compress_cache", false));
+-	m_cf.setBufferSize(m_cfg.getInt(" GENERAL", "cover_buffer", 120));
++	int covers = m_cfg.getInt(" GENERAL", "cover_buffer", 120);
++	if( covers<(int)m_gameList.size() )
++	{
++		covers = (int)m_gameList.size()+16;
++		m_cfg.setInt(" GENERAL", "cover_buffer", covers);
++		m_cfg.save();
++	}
++	m_cf.setBufferSize(covers);
+ 	filename = m_theme.getString(domain, "sound_flip");
+ 	cfFlipSnd.fromWAVFile(sfmt("%s/%s", m_themeDataDir.c_str(), filename.c_str()).c_str());
+ 	filename = m_theme.getString(domain, "sound_hover");
+@@ -566,6 +574,7 @@
+ 	_initDownloadMenu(theme);
+ 	_initCodeMenu(theme);
+ 	_initAboutMenu(theme);
++	_initHomeKeyMenu(theme);
+ 	_initWBFSMenu(theme);
+ 	_initCFThemeMenu(theme);
+ 	_initGameSettingsMenu(theme);
+@@ -814,29 +823,6 @@
+ 	}
+ }
+ 
+-u32 CMenu::_btnRepeat(u32 btn)
+-{
+-	u32 b = 0;
+-
+-	if ((btn & WPAD_BUTTON_LEFT) != 0)
+-	{
+-		if (m_padLeftDelay == 0 || m_padLeftDelay > g_repeatDelay)
+-			b |= WPAD_BUTTON_LEFT;
+-		++m_padLeftDelay;
+-	}
+-	else
+-		m_padLeftDelay = 0;
+-	if ((btn & WPAD_BUTTON_RIGHT) != 0)
+-	{
+-		if (m_padRightDelay == 0 || m_padRightDelay > g_repeatDelay)
+-			b |= WPAD_BUTTON_RIGHT;
+-		++m_padRightDelay;
+-	}
+-	else
+-		m_padRightDelay = 0;
+-	return b;
+-}
+-
+ void CMenu::_initCF(void)
+ {
+ 	string id;
+@@ -861,7 +847,14 @@
+ 	m_cf.setBoxMode(m_cfg.getBool(" GENERAL", "box_mode", true));
+ 	cmpr = m_cfg.getBool(" GENERAL", "allow_texture_compression", true);
+ 	m_cf.setCompression(cmpr);
+-	m_cf.setBufferSize(m_cfg.getInt(" GENERAL", "cover_buffer", 120));
++	int covers = m_cfg.getInt(" GENERAL", "cover_buffer", 120);
++	if( covers<(int)m_gameList.size() )
++	{
++		covers = (int)m_gameList.size()+16;
++		m_cfg.setInt(" GENERAL", "cover_buffer", covers);
++		m_cfg.save();
++	}
++	m_cf.setBufferSize(covers);
+ 	if (m_cf.start())
+ 		if (m_curGameId.empty() || !m_cf.findId(m_curGameId.c_str(), true))
+ 			m_cf.findId(m_cfg.getString(" GENERAL", "current_game").c_str(), true);
+diff -ruwN wiiflow-r42/source/menu/menu.hpp wiiflow-r42-book-mod-r7/source/menu/menu.hpp
+--- wiiflow-r42/source/menu/menu.hpp	Thu Mar 18 19:10:57 2010
++++ wiiflow-r42-book-mod-r7/source/menu/menu.hpp	Tue Apr 20 21:43:06 2010
+@@ -378,7 +378,6 @@
+ 		float step[4];
+ 		float minMaxVal[4][2];
+ 	};
+-	u32 _btnRepeat(u32 btn);
+ 	// 
+ 	bool _loadGameList(void);
+ 	void _initCF(void);
+@@ -537,8 +536,44 @@
+ 	static const int _ios[6];
+ 	static const SCFParamDesc _cfParams[];
+ 	static const int _nbCfgPages;
++
++private:
++
++#define HR_BUFF_LEN		368
++#define	HR_BUFF_BLEN	160
++#define	HR_NAMELEN		256
++
++	typedef struct
++	{
++		char dirname[ISFS_MAXPATH];
++		char titleid[8];
++		char hrname[HR_NAMELEN];
++		u32 id_hi;
++		u32 id_lo;
++	} dirent_t;
++
++	typedef std::vector<dirent_t> channel_list_t;
++
++	STexture m_homeBg;
++	u32 m_homeLblTitle;
++	u32 m_homeLblTextBox;
++	void _initHomeKeyMenu(SThemeData &theme);
++	void _textHomeKeyMenu(void);
++	void _hideHomeKeyMenu(bool instant = false);
++	void _showHomeKeyMenu(void);
++	bool _home_key_menu(void);
++	bool _run_channel_menu(void);
++	s32 get_title_dir(u32 dirhi, dirent_t *ent, u32 *cnt);
++	s32 get_apps(u32 dirhi, const char * tlo, dirent_t *ent, u32 *cnt);
++	void get_hrname(dirent_t * t, u32 number, Config & titles);
++	s32 get_channel_list(channel_list_t & chlist);
++	void filter_channel_list(channel_list_t & chlist);
++	u64 show_channel_menu(channel_list_t & chlist);
+ };
+ 
+ #define ARRAY_SIZE(a)		(sizeof a / sizeof a[0])
+ 
++enum {HKM_NOTHING, HKM_REBOOT, HKM_IDLE, HKM_SHUTDOWN, HKM_HBC, HKM_RUN_TITLE};
++int Exit_task(int retcode);
++bool more_input_scan(s32 & ps, u32 & btn);
+ #endif // !defined(__MENU_HPP)
+diff -ruwN wiiflow-r42/source/menu/menu_about.cpp wiiflow-r42-book-mod-r7/source/menu/menu_about.cpp
+--- wiiflow-r42/source/menu/menu_about.cpp	Thu Mar 18 19:10:57 2010
++++ wiiflow-r42-book-mod-r7/source/menu/menu_about.cpp	Sun May  2 17:08:40 2010
+@@ -6,7 +6,7 @@
+ 
+ #define APP_NAME		"WiiFlow"
+ #define APP_VERSION		"1.1 R"
+-#define LOADER_AUTHOR	"Kwiirk & Waninkoko, Hermes"
++#define LOADER_AUTHOR	"Kwiirk & Waninkoko, Hermes, Book"
+ #define GUI_AUTHOR		"Hibernatus, Narolez, Wiimm, r-win"
+ #define THANKS			"Lustar, CedWii, Benjay, Domi78, Oops, Celtiore, Jiiwah, FluffyKiwi, Roku93, Spayrosam, Bluescreen81, Chappy23, BlindDude, Bubba, DJTaz, OggZee, Usptactical, WiiPower, Hermes"
+ #define THANKS_SITES	"devkitpro.org, wiibrew.org, wiitdb.com"
+@@ -19,6 +19,7 @@
+ {
+ 	s32 padsState;
+ 	WPADData *wd;
++	u32 btn = 0;
+ 
+ 	WPAD_Rumble(WPAD_CHAN_0, 0);
+ 	_showAbout();
+@@ -27,6 +28,7 @@
+ 		WPAD_ScanPads();
+ 		padsState = WPAD_ButtonsDown(0);
+ 		wd = WPAD_Data(0);
++		more_input_scan(padsState, btn);
+ 		_mainLoopCommon(wd);
+ 	} while ((padsState & (WPAD_BUTTON_HOME | WPAD_BUTTON_A | WPAD_BUTTON_B)) == 0);
+ 	WPAD_Rumble(WPAD_CHAN_0, 0);
+@@ -82,7 +84,7 @@
+ 
+ void CMenu::_textAbout(void)
+ {
+-	m_btnMgr.setText(m_aboutLblTitle, wfmt(_fmt("appname", L"%s v%s%s"), APP_NAME, APP_VERSION, SVN_REV), true);
++	m_btnMgr.setText(m_aboutLblTitle, wfmt(_fmt("appname", L"%s v1.1R42BMr7"), APP_NAME), true);
+ 	m_btnMgr.setText(m_aboutLblOrigAuthor, wfmt(_fmt("about1", L"Loader by %s"), LOADER_AUTHOR), true);
+ 	m_btnMgr.setText(m_aboutLblAuthor, wfmt(_fmt("about2", L"GUI by %s"), GUI_AUTHOR), true);
+ 	wstringEx thanksTo(m_cfg.getWString(" GENERAL", "insertnamehere"));
+diff -ruwN wiiflow-r42/source/menu/menu_cftheme.cpp wiiflow-r42-book-mod-r7/source/menu/menu_cftheme.cpp
+--- wiiflow-r42/source/menu/menu_cftheme.cpp	Sun Oct 11 05:24:41 2009
++++ wiiflow-r42-book-mod-r7/source/menu/menu_cftheme.cpp	Mon Apr  5 03:36:40 2010
+@@ -335,7 +335,7 @@
+ 		WPAD_ScanPads();
+ 		padsState = WPAD_ButtonsDown(0);
+ 		wd = WPAD_Data(0);
+-		btn = _btnRepeat(wd->btns_h);
++		more_input_scan(padsState, btn);
+ 		btnDelay = (wd->btns_h & WPAD_BUTTON_B) != 0 ? 1 : 4;
+ 		if ((padsState & WPAD_BUTTON_HOME) != 0)
+ 		{
+diff -ruwN wiiflow-r42/source/menu/menu_code.cpp wiiflow-r42-book-mod-r7/source/menu/menu_code.cpp
+--- wiiflow-r42/source/menu/menu_code.cpp	Tue Oct  6 16:11:48 2009
++++ wiiflow-r42-book-mod-r7/source/menu/menu_code.cpp	Mon Apr  5 03:36:51 2010
+@@ -2,6 +2,7 @@
+ #include "menu.hpp"
+ 
+ #include <wiiuse/wpad.h>
++#include <wiikeyboard/keyboard.h>
+ 
+ extern const u8 delete_png[];
+ extern const u8 deletes_png[];
+@@ -49,7 +50,7 @@
+ 		WPAD_ScanPads();
+ 		padsState = WPAD_ButtonsDown(0);
+ 		wd = WPAD_Data(0);
+-		btn = _btnRepeat(wd->btns_h);
++		more_input_scan(padsState, btn);
+ 		if ((padsState & (WPAD_BUTTON_HOME | WPAD_BUTTON_B)) != 0)
+ 			break;
+ 		if (wd->ir.valid)
+@@ -81,6 +82,34 @@
+ 		}
+ 		if (n >= sizeof code)
+ 			break;
++		keyboard_event ke;
++		s32 kst = KEYBOARD_GetEvent(&ke);
++		if( kst && ke.type == KEYBOARD_PRESSED )
++		{
++			int kcd = -1;
++			if( ke.symbol>=KS_0 && ke.symbol<=KS_9 )
++				kcd = ke.symbol - KS_0;
++			else if	( ke.symbol>=KS_KP_0 && ke.symbol<=KS_KP_9 )
++				kcd = ke.symbol - KS_KP_0;
++			else if( ke.symbol==KS_KP_Home || ke.symbol==KS_Escape ||
++					ke.symbol==KS_Home )
++			{
++				if( erase )
++				{
++					memset(code, 0, sizeof code);
++					n = sizeof code;
++				}
++				break;
++			}
++			else if( ke.symbol==KS_BackSpace || ke.symbol==KS_b || ke.symbol==KS_B )
++				break;
++			if( kcd>=0 )
++			{
++				codeLbl[n * 2] = 'X';
++				code[n++] = '0' + (char) kcd;
++				m_btnMgr.setText(m_codeLblTitle, codeLbl);
++			}
++		}
+ 		_mainLoopCommon(wd);
+ 	}
+ 	_hideCode();
+diff -ruwN wiiflow-r42/source/menu/menu_config.cpp wiiflow-r42-book-mod-r7/source/menu/menu_config.cpp
+--- wiiflow-r42/source/menu/menu_config.cpp	Fri Mar 12 00:34:01 2010
++++ wiiflow-r42-book-mod-r7/source/menu/menu_config.cpp	Mon Apr  5 03:37:09 2010
+@@ -119,7 +119,7 @@
+ 		WPAD_ScanPads();
+ 		padsState = WPAD_ButtonsDown(0);
+ 		wd = WPAD_Data(0);
+-		btn = _btnRepeat(wd->btns_h);
++		more_input_scan(padsState, btn);
+ 		if ((padsState & (WPAD_BUTTON_HOME | WPAD_BUTTON_B)) != 0)
+ 			break;
+ 		if (wd->ir.valid)
+diff -ruwN wiiflow-r42/source/menu/menu_config2.cpp wiiflow-r42-book-mod-r7/source/menu/menu_config2.cpp
+--- wiiflow-r42/source/menu/menu_config2.cpp	Tue Oct  6 16:11:48 2009
++++ wiiflow-r42-book-mod-r7/source/menu/menu_config2.cpp	Mon Apr  5 03:37:16 2010
+@@ -87,7 +87,7 @@
+ 		WPAD_ScanPads();
+ 		padsState = WPAD_ButtonsDown(0);
+ 		wd = WPAD_Data(0);
+-		btn = _btnRepeat(wd->btns_h);
++		more_input_scan(padsState, btn);
+ 		if ((padsState & (WPAD_BUTTON_HOME | WPAD_BUTTON_B)) != 0)
+ 			break;
+ 		if (wd->ir.valid)
+diff -ruwN wiiflow-r42/source/menu/menu_config3.cpp wiiflow-r42-book-mod-r7/source/menu/menu_config3.cpp
+--- wiiflow-r42/source/menu/menu_config3.cpp	Tue Oct  6 16:11:48 2009
++++ wiiflow-r42-book-mod-r7/source/menu/menu_config3.cpp	Mon Apr  5 03:37:23 2010
+@@ -87,7 +87,7 @@
+ 		WPAD_ScanPads();
+ 		padsState = WPAD_ButtonsDown(0);
+ 		wd = WPAD_Data(0);
+-		btn = _btnRepeat(wd->btns_h);
++		more_input_scan(padsState, btn);
+ 		if ((padsState & (WPAD_BUTTON_HOME | WPAD_BUTTON_B)) != 0)
+ 			break;
+ 		if (wd->ir.valid)
+diff -ruwN wiiflow-r42/source/menu/menu_config4.cpp wiiflow-r42-book-mod-r7/source/menu/menu_config4.cpp
+--- wiiflow-r42/source/menu/menu_config4.cpp	Tue Oct  6 16:11:48 2009
++++ wiiflow-r42-book-mod-r7/source/menu/menu_config4.cpp	Mon Apr  5 03:37:30 2010
+@@ -66,7 +66,7 @@
+ 		WPAD_ScanPads();
+ 		padsState = WPAD_ButtonsDown(0);
+ 		wd = WPAD_Data(0);
+-		btn = _btnRepeat(wd->btns_h);
++		more_input_scan(padsState, btn);
+ 		if ((padsState & (WPAD_BUTTON_HOME | WPAD_BUTTON_B)) != 0)
+ 			break;
+ 		if (wd->ir.valid)
+diff -ruwN wiiflow-r42/source/menu/menu_config5.cpp wiiflow-r42-book-mod-r7/source/menu/menu_config5.cpp
+--- wiiflow-r42/source/menu/menu_config5.cpp	Wed Mar 17 06:20:06 2010
++++ wiiflow-r42-book-mod-r7/source/menu/menu_config5.cpp	Mon Apr  5 03:37:36 2010
+@@ -95,7 +95,7 @@
+ 		WPAD_ScanPads();
+ 		padsState = WPAD_ButtonsDown(0);
+ 		wd = WPAD_Data(0);
+-		btn = _btnRepeat(wd->btns_h);
++		more_input_scan(padsState, btn);
+ 		if ((padsState & (WPAD_BUTTON_HOME | WPAD_BUTTON_B)) != 0)
+ 			break;
+ 		if (wd->ir.valid)
+@@ -128,7 +128,7 @@
+ 				break;
+ 			else if (m_btnMgr.selected() == m_config5BtnPartitionP)
+ 			{
+-				char buf[5];
++				char buf[10];
+ 				currentPartition = loopNum(currentPartition + 1, amountOfPartitions);
+ 				gprintf("Next item: %d\n", currentPartition);
+ 				WBFS_GetPartitionName(currentPartition, (char *) &buf);
+@@ -138,7 +138,7 @@
+ 			}
+ 			else if (m_btnMgr.selected() == m_config5BtnPartitionM)
+ 			{
+-				char buf[5];
++				char buf[10];
+ 				currentPartition = loopNum(currentPartition - 1, amountOfPartitions);
+ 				gprintf("Next item: %d\n", currentPartition);
+ 				WBFS_GetPartitionName(currentPartition, (char *) &buf);
+diff -ruwN wiiflow-r42/source/menu/menu_config_adv.cpp wiiflow-r42-book-mod-r7/source/menu/menu_config_adv.cpp
+--- wiiflow-r42/source/menu/menu_config_adv.cpp	Fri Mar 12 00:34:01 2010
++++ wiiflow-r42-book-mod-r7/source/menu/menu_config_adv.cpp	Mon Apr  5 03:37:59 2010
+@@ -140,7 +140,7 @@
+ 		WPAD_ScanPads();
+ 		padsState = WPAD_ButtonsDown(0);
+ 		wd = WPAD_Data(0);
+-		btn = _btnRepeat(wd->btns_h);
++		more_input_scan(padsState, btn);
+ 		if ((padsState & (WPAD_BUTTON_HOME | WPAD_BUTTON_B)) != 0)
+ 			break;
+ 		if (wd->ir.valid)
+diff -ruwN wiiflow-r42/source/menu/menu_config_game.cpp wiiflow-r42-book-mod-r7/source/menu/menu_config_game.cpp
+--- wiiflow-r42/source/menu/menu_config_game.cpp	Fri Mar 12 00:34:01 2010
++++ wiiflow-r42-book-mod-r7/source/menu/menu_config_game.cpp	Mon Apr  5 03:38:07 2010
+@@ -218,7 +218,7 @@
+ 		WPAD_ScanPads();
+ 		padsState = WPAD_ButtonsDown(0);
+ 		wd = WPAD_Data(0);
+-		btn = _btnRepeat(wd->btns_h);
++		more_input_scan(padsState, btn);
+ 		if ((padsState & (WPAD_BUTTON_HOME | WPAD_BUTTON_B)) != 0)
+ 			break;
+ 		if (wd->ir.valid)
+diff -ruwN wiiflow-r42/source/menu/menu_configsnd.cpp wiiflow-r42-book-mod-r7/source/menu/menu_configsnd.cpp
+--- wiiflow-r42/source/menu/menu_configsnd.cpp	Thu Mar 18 14:31:14 2010
++++ wiiflow-r42-book-mod-r7/source/menu/menu_configsnd.cpp	Mon Apr  5 03:37:52 2010
+@@ -91,7 +91,7 @@
+ 		WPAD_ScanPads();
+ 		padsState = WPAD_ButtonsDown(0);
+ 		wd = WPAD_Data(0);
+-		btn = _btnRepeat(wd->btns_h);
++		more_input_scan(padsState, btn);
+ 		if ((padsState & (WPAD_BUTTON_HOME | WPAD_BUTTON_B)) != 0)
+ 			break;
+ 		if (wd->ir.valid)
+diff -ruwN wiiflow-r42/source/menu/menu_download.cpp wiiflow-r42-book-mod-r7/source/menu/menu_download.cpp
+--- wiiflow-r42/source/menu/menu_download.cpp	Wed Mar 17 06:20:06 2010
++++ wiiflow-r42-book-mod-r7/source/menu/menu_download.cpp	Mon Apr  5 03:38:13 2010
+@@ -430,7 +430,7 @@
+ 		WPAD_ScanPads();
+ 		padsState = WPAD_ButtonsDown(0);
+ 		wd = WPAD_Data(0);
+-		btn = _btnRepeat(wd->btns_h);
++		more_input_scan(padsState, btn);
+ 		if ((padsState & (WPAD_BUTTON_HOME | WPAD_BUTTON_B)) != 0 && !m_thrdWorking)
+ 			break;
+ 		if (wd->ir.valid)
+diff -ruwN wiiflow-r42/source/menu/menu_error.cpp wiiflow-r42-book-mod-r7/source/menu/menu_error.cpp
+--- wiiflow-r42/source/menu/menu_error.cpp	Sun Oct 11 05:24:41 2009
++++ wiiflow-r42-book-mod-r7/source/menu/menu_error.cpp	Mon Apr  5 03:44:22 2010
+@@ -9,6 +9,7 @@
+ {
+ 	s32 padsState;
+ 	WPADData *wd;
++	u32 btn = 0;
+ 
+ 	WPAD_Rumble(WPAD_CHAN_0, 0);
+ 	_hideAbout();
+@@ -28,6 +29,7 @@
+ 		WPAD_ScanPads();
+ 		padsState = WPAD_ButtonsDown(0);
+ 		wd = WPAD_Data(0);
++		more_input_scan(padsState, btn);
+ 		_mainLoopCommon(wd);
+ 	} while ((padsState & (WPAD_BUTTON_HOME | WPAD_BUTTON_A | WPAD_BUTTON_B)) == 0);
+ 	WPAD_Rumble(WPAD_CHAN_0, 0);
+diff -ruwN wiiflow-r42/source/menu/menu_game.cpp wiiflow-r42-book-mod-r7/source/menu/menu_game.cpp
+--- wiiflow-r42/source/menu/menu_game.cpp	Wed Mar 31 05:01:51 2010
++++ wiiflow-r42-book-mod-r7/source/menu/menu_game.cpp	Mon Apr  5 03:38:22 2010
+@@ -130,7 +130,7 @@
+ 			first = false;
+ 		padsState = WPAD_ButtonsDown(0);
+ 		wd = WPAD_Data(0);
+-		btn = _btnRepeat(wd->btns_h);
++		more_input_scan(padsState, btn);
+ 		if ((padsState & (WPAD_BUTTON_HOME | WPAD_BUTTON_B)) != 0)
+ 			break;
+ 		if (wd->ir.valid)
+diff -ruwN wiiflow-r42/source/menu/menu_home.cpp wiiflow-r42-book-mod-r7/source/menu/menu_home.cpp
+--- wiiflow-r42/source/menu/menu_home.cpp	Thu Jan  1 08:00:00 1970
++++ wiiflow-r42-book-mod-r7/source/menu/menu_home.cpp	Mon May  3 09:04:06 2010
+@@ -0,0 +1,875 @@
++
++#include "menu.hpp"
++
++#include <wiiuse/wpad.h>
++#include <wiikeyboard/keyboard.h>
++#include <ogc/lwp_watchdog.h>
++#include <ctype.h>
++#include <dirent.h>
++#include <malloc.h>
++#include <string.h>
++#include <unistd.h>
++#include <tr1/unordered_map>
++#include "loader/sys.h"
++#include "utils.h"
++
++using namespace std;
++using namespace tr1;
++
++extern "C" u32 GetReturnTo(void);
++
++u32 _btnRepeat(u32 btn, s32 ps)
++{
++	static u32 lastbtn = 0;
++	static u64 delaybtn = 0;
++	static u64 timeoutbtn = 0;
++	u64 nowclk = ticks_to_millisecs(gettime());
++	const u64 cdelay = 180; //0.18sec
++	const u64 ctimout = 650; //0.65sec
++
++	if( !(btn & (WPAD_BUTTON_LEFT | WPAD_BUTTON_RIGHT)) && 
++		!(ps & (WPAD_BUTTON_LEFT | WPAD_BUTTON_RIGHT)) )
++		return 0;
++
++	u32 b=0;
++	
++	if( btn & WPAD_BUTTON_LEFT )
++	{
++		if( (nowclk>delaybtn) || (lastbtn!=WPAD_BUTTON_LEFT) )
++		{
++			b |= WPAD_BUTTON_LEFT;
++			if( nowclk>timeoutbtn || (lastbtn!=WPAD_BUTTON_LEFT) )
++			{
++				delaybtn = nowclk + ctimout;
++				timeoutbtn = delaybtn + cdelay;
++			}
++			else
++			{
++				delaybtn = nowclk + cdelay;
++				timeoutbtn = delaybtn + ctimout;
++			}
++		}
++		lastbtn = WPAD_BUTTON_LEFT;
++	}
++	else if( btn & WPAD_BUTTON_RIGHT )
++	{
++		if( (nowclk>delaybtn) || (lastbtn!=WPAD_BUTTON_RIGHT) )
++		{
++			b |= WPAD_BUTTON_RIGHT;
++			if( nowclk>timeoutbtn || (lastbtn!=WPAD_BUTTON_RIGHT) )
++			{
++				delaybtn = nowclk + ctimout;
++				timeoutbtn = delaybtn + cdelay;
++			}
++			else
++			{
++				delaybtn = nowclk + cdelay;
++				timeoutbtn = delaybtn + ctimout;
++			}
++		}
++		lastbtn = WPAD_BUTTON_RIGHT;
++	}
++	if( ps & WPAD_BUTTON_LEFT )
++		return WPAD_BUTTON_LEFT;
++	else if( ps & WPAD_BUTTON_RIGHT )
++		return WPAD_BUTTON_RIGHT;
++	return b;
++}
++
++bool more_input_scan(s32 & ps, u32 & btn)
++{
++	static unordered_map<u16,s32> kb2wpad;
++	static unordered_map<s32,s32> cpad2wpad;
++	static unordered_map<s32,s32> pad2wpad;
++	if( 0==kb2wpad.size() )
++	{
++		kb2wpad[KS_Escape] = WPAD_BUTTON_HOME;
++		kb2wpad[KS_Home] = WPAD_BUTTON_HOME;
++		kb2wpad[KS_Right] = WPAD_BUTTON_RIGHT;
++		kb2wpad[KS_Left] = WPAD_BUTTON_LEFT;
++		kb2wpad[KS_Up] = WPAD_BUTTON_UP;
++		kb2wpad[KS_Down] = WPAD_BUTTON_DOWN;
++		kb2wpad[KS_plus] = WPAD_BUTTON_PLUS;
++		kb2wpad[KS_equal] = WPAD_BUTTON_PLUS;
++		kb2wpad[KS_minus] = WPAD_BUTTON_MINUS;
++		kb2wpad[KS_underscore] = WPAD_BUTTON_MINUS;
++		kb2wpad[KS_Return] = WPAD_BUTTON_A;
++		kb2wpad[KS_A] = WPAD_BUTTON_A;
++		kb2wpad[KS_a] = WPAD_BUTTON_A;
++		kb2wpad[KS_BackSpace] = WPAD_BUTTON_B;
++		kb2wpad[KS_B] = WPAD_BUTTON_B;
++		kb2wpad[KS_b] = WPAD_BUTTON_B;
++		kb2wpad[KS_1] = WPAD_BUTTON_1;
++		kb2wpad[KS_2] = WPAD_BUTTON_2;
++
++		kb2wpad[KS_KP_Home] = WPAD_BUTTON_HOME;
++		kb2wpad[KS_KP_Left] = WPAD_BUTTON_LEFT;
++		kb2wpad[KS_KP_Right] = WPAD_BUTTON_RIGHT;
++		kb2wpad[KS_KP_Up] = WPAD_BUTTON_UP;
++		kb2wpad[KS_KP_Down] = WPAD_BUTTON_DOWN;
++		kb2wpad[KS_KP_1] = WPAD_BUTTON_1;
++		kb2wpad[KS_KP_End] = WPAD_BUTTON_1;
++		kb2wpad[KS_KP_2] = WPAD_BUTTON_2;
++		kb2wpad[KS_KP_Enter] = WPAD_BUTTON_A;
++		kb2wpad[KS_KP_Insert] = WPAD_BUTTON_B;
++		kb2wpad[KS_KP_Add] = WPAD_BUTTON_PLUS;
++		kb2wpad[KS_KP_Subtract] = WPAD_BUTTON_MINUS;
++
++		cpad2wpad[WPAD_CLASSIC_BUTTON_HOME] = WPAD_BUTTON_HOME;
++		cpad2wpad[WPAD_CLASSIC_BUTTON_UP] = WPAD_BUTTON_UP;
++		cpad2wpad[WPAD_CLASSIC_BUTTON_LEFT] = WPAD_BUTTON_LEFT;
++		cpad2wpad[WPAD_CLASSIC_BUTTON_DOWN] = WPAD_BUTTON_DOWN;
++		cpad2wpad[WPAD_CLASSIC_BUTTON_RIGHT] = WPAD_BUTTON_RIGHT;
++		cpad2wpad[WPAD_CLASSIC_BUTTON_A] = WPAD_BUTTON_A;
++		cpad2wpad[WPAD_CLASSIC_BUTTON_B] = WPAD_BUTTON_B;
++		cpad2wpad[WPAD_CLASSIC_BUTTON_X] = WPAD_BUTTON_1;
++		cpad2wpad[WPAD_CLASSIC_BUTTON_Y] = WPAD_BUTTON_2;
++		cpad2wpad[WPAD_CLASSIC_BUTTON_PLUS] = WPAD_BUTTON_PLUS;
++		cpad2wpad[WPAD_CLASSIC_BUTTON_MINUS] = WPAD_BUTTON_MINUS;
++
++		pad2wpad[PAD_TRIGGER_Z] = WPAD_BUTTON_HOME;
++		pad2wpad[PAD_BUTTON_UP] = WPAD_BUTTON_UP;
++		pad2wpad[PAD_BUTTON_LEFT] = WPAD_BUTTON_LEFT;
++		pad2wpad[PAD_BUTTON_DOWN] = WPAD_BUTTON_DOWN;
++		pad2wpad[PAD_BUTTON_RIGHT] = WPAD_BUTTON_RIGHT;
++		pad2wpad[PAD_BUTTON_A] = WPAD_BUTTON_A;
++		pad2wpad[PAD_BUTTON_B] = WPAD_BUTTON_B;
++		pad2wpad[PAD_BUTTON_X] = WPAD_BUTTON_1;
++		pad2wpad[PAD_BUTTON_Y] = WPAD_BUTTON_2;
++		pad2wpad[PAD_TRIGGER_R] = WPAD_BUTTON_PLUS;
++		pad2wpad[PAD_TRIGGER_L] = WPAD_BUTTON_MINUS;
++	}
++
++	bool ret = false;
++	btn = 0;
++	
++	// Classic pad
++	const s32 cpadarr[] = {WPAD_CLASSIC_BUTTON_HOME, WPAD_CLASSIC_BUTTON_UP, 
++	WPAD_CLASSIC_BUTTON_LEFT, WPAD_CLASSIC_BUTTON_DOWN, WPAD_CLASSIC_BUTTON_RIGHT,
++	WPAD_CLASSIC_BUTTON_A, WPAD_CLASSIC_BUTTON_B, WPAD_CLASSIC_BUTTON_X, 
++	WPAD_CLASSIC_BUTTON_Y, WPAD_CLASSIC_BUTTON_PLUS, WPAD_CLASSIC_BUTTON_MINUS};
++	unordered_map<s32,s32>::const_iterator ci;
++	for( u32 i = 0; i<sizeof(cpadarr)/sizeof(cpadarr[0]); ++i)
++	{
++		if( ps & cpadarr[i] )
++		{
++			ci = cpad2wpad.find(cpadarr[i]);
++			if( cpad2wpad.end() != ci )
++			{
++				ps &= ~cpadarr[i];
++				ps |= ci->second;
++				ret = true;
++			}
++		}
++	}
++	u32 wpadhs = WPAD_ButtonsHeld(0);
++	u32 btnin = 0;
++	if( wpadhs & (WPAD_CLASSIC_BUTTON_LEFT|WPAD_BUTTON_LEFT) )
++		btnin |= WPAD_BUTTON_LEFT;
++	if( wpadhs & (WPAD_CLASSIC_BUTTON_RIGHT|WPAD_BUTTON_RIGHT) )
++		btnin |= WPAD_BUTTON_RIGHT;
++	if( btnin )
++	{
++		btn = _btnRepeat(btnin, ps);
++		if( btn )
++			ret = true;
++	}
++	if( ret )
++		return true;
++
++	// NGC pad
++	const s32 padarr[] = {PAD_TRIGGER_Z, PAD_BUTTON_UP, PAD_BUTTON_LEFT, PAD_BUTTON_DOWN, PAD_BUTTON_RIGHT,
++	PAD_BUTTON_A, PAD_BUTTON_B, PAD_BUTTON_X, PAD_BUTTON_Y, PAD_TRIGGER_R, PAD_TRIGGER_L};
++	PAD_ScanPads();
++	s32 padps = PAD_ButtonsDown(PAD_CHAN0);
++	s32 padout = 0;
++	unordered_map<s32,s32>::const_iterator pi;
++	for( u32 i = 0; i<sizeof(padarr)/sizeof(padarr[0]); ++i)
++	{
++		if( padps & padarr[i] )
++		{
++			pi = pad2wpad.find( padarr[i] );
++			if( pad2wpad.end() != pi )
++			{
++				padout |= pi->second;
++				ret = true;
++			}
++		}
++	}
++	btnin = 0;
++	s32 padhs = PAD_ButtonsHeld(PAD_CHAN0);
++	if( padhs & PAD_BUTTON_LEFT )
++		btnin |= WPAD_BUTTON_LEFT;
++	if( padhs & PAD_BUTTON_RIGHT )
++		btnin |= WPAD_BUTTON_RIGHT;
++	if( btnin )
++	{
++		btn = _btnRepeat(btnin, padout);
++		if( btn )
++			ret = true;
++	}
++	if( ret )
++	{
++		ps = padout;
++		return true;
++	}
++	
++	// Keyboard
++	keyboard_event ke;
++	s32 kst = KEYBOARD_GetEvent(&ke);
++	if( 0==kst || ke.type != KEYBOARD_PRESSED )
++		return false;
++	unordered_map<u16,s32>::const_iterator ki;
++	ki = kb2wpad.find(ke.symbol);
++	if( kb2wpad.end() == ki )
++		return false;
++	ps = ki->second;
++	btnin = 0;
++	if( KS_KP_Left==ke.symbol || KS_Left==ke.symbol )
++		btnin |= WPAD_BUTTON_LEFT;
++	if( KS_KP_Right==ke.symbol || KS_Right==ke.symbol )
++		btnin |= WPAD_BUTTON_RIGHT;
++	if( btnin )
++		btn = _btnRepeat(btnin, btnin);
++	if( !btn && !ps )
++		return false;
++	return true;
++}
++
++static int exit_action = HKM_NOTHING;
++static u64 gp_tid = 0;
++
++bool CMenu::_home_key_menu(void)
++{
++	s32 padsState;
++	WPADData *wd;
++	u32 btn = 0;
++	bool ret = false;
++
++	WPAD_Rumble(WPAD_CHAN_0, 0);
++	_showHomeKeyMenu();
++	do
++	{
++		WPAD_ScanPads();
++		padsState = WPAD_ButtonsDown(0);
++		wd = WPAD_Data(0);
++		more_input_scan(padsState, btn);
++		if( padsState & WPAD_BUTTON_RIGHT ) {
++				exit_action = HKM_REBOOT;
++				ret = true;
++				break;
++		} else if( padsState & WPAD_BUTTON_LEFT ) {
++				exit_action = HKM_IDLE;
++				ret = true;
++				break;
++		} else if( padsState & WPAD_BUTTON_UP ) {
++				char code[4];
++				_hideHomeKeyMenu();
++				if (_code(code) && memcmp(code, m_cfg.getString(" GENERAL", "parent_code", "").c_str(), 4) == 0)
++					m_locked = false;
++				_showHomeKeyMenu();
++				ret = false;
++				break;
++		} else if( padsState & WPAD_BUTTON_DOWN ) {
++				exit_action = HKM_SHUTDOWN;
++				ret = true;
++				break;
++		} else if( padsState & WPAD_BUTTON_PLUS ) {
++				ret = _run_channel_menu();
++				break;;
++		} else if( padsState & (WPAD_BUTTON_HOME | WPAD_BUTTON_B) ) {
++				ret = false;
++				break;;
++		} else if( !m_locked && (padsState & WPAD_BUTTON_MINUS) ) {
++				*(vu32*)0x8132FFFB = 0x50756e65;
++				DCFlushRange((void*)0x8132FFFB,4);
++				exit_action = HKM_REBOOT;
++				ret = true;
++				break;
++		} else if( !m_locked && (padsState & WPAD_BUTTON_1) ) {
++				exit_action = HKM_HBC;
++				ret = true;
++				break;
++		} else if( !m_locked && (padsState & WPAD_BUTTON_2) ) {
++				*(vu32*)0x8132FFFB = 0x4461636f;
++				DCFlushRange((void*)0x8132FFFB,4);
++				exit_action = HKM_REBOOT;
++				ret = true;
++				break;
++		} else if( padsState & WPAD_BUTTON_A ) {
++				ret = true;
++				break;
++		}
++		_mainLoopCommon(wd);
++	} while (true);
++	WPAD_Rumble(WPAD_CHAN_0, 0);
++	_hideHomeKeyMenu(false);
++	return ret;
++}
++
++void CMenu::_hideHomeKeyMenu(bool instant)
++{
++	m_btnMgr.hide(m_homeLblTitle, instant);
++	m_btnMgr.hide(m_homeLblTextBox, instant);
++}
++
++void CMenu::_showHomeKeyMenu(void)
++{
++	_setBg(m_homeBg, m_homeBg);
++	_textHomeKeyMenu();
++	m_btnMgr.show(m_homeLblTitle);
++	m_btnMgr.show(m_homeLblTextBox);
++}
++
++u32 rtid_ = 0;
++	
++void CMenu::_initHomeKeyMenu(CMenu::SThemeData &theme)
++{
++	STexture emptyTex;
++	m_homeBg = _texture(theme.texSet, "HOME/BG", "texture", theme.bg);
++	m_homeLblTitle = _addLabel(theme, "HOME/TITLE", theme.lblFont, L"", 170, 25, 300, 45, theme.titleFontColor, FTGX_JUSTIFY_CENTER | FTGX_ALIGN_MIDDLE, emptyTex);
++	m_homeLblTextBox = _addLabel(theme, "HOME/TEXTBOX", theme.lblFont, L"", 40, 70, 560, 420, theme.txtFontColor, FTGX_JUSTIFY_LEFT | FTGX_ALIGN_MIDDLE);
++	// 
++	_setHideAnim(m_homeLblTitle, "HOME/TITLE", 0, 100, 0.f, 0.f);
++	_setHideAnim(m_homeLblTextBox, "HOME/TEXTBOX", -100, 0, 0.f, 0.f);
++	// 
++	_hideHomeKeyMenu(true);
++	_textHomeKeyMenu();
++
++	Config channels;
++	channels.load(sfmt("%s/channels.ini", m_dataDir.c_str()).c_str());	
++	if( !channels.loaded() )
++		return;
++	string rtid = channels.getString("COMMAND", "return_to_title_id", "");
++	if( rtid!="" && rtid.size()==4 )
++	{
++		char srtid[8];
++		strcpy(srtid, rtid.c_str());
++		strupr(srtid);
++		memcpy(&rtid_, srtid, sizeof(u32));
++	}
++	else
++	{
++		rtid = channels.getString("COMMAND", "return_to_titile_id", "");
++		if( rtid!="" && rtid.size()==4 )
++		{
++			char srtid[8];
++			strcpy(srtid, rtid.c_str());
++			strupr(srtid);
++			memcpy(&rtid_, srtid, sizeof(u32));
++		}
++		else
++		{
++			rtid_ = 0;
++		}
++	}
++	
++}
++
++void CMenu::_textHomeKeyMenu(void)
++{
++	m_btnMgr.setText(m_homeLblTitle, _t("homekeymenu", L"Home key Menu"), true);
++	wstringEx txtbox;
++	txtbox  = _t("hkmline1", L"Up: Parent unlock.\n");
++	txtbox += _t("hkmline2", L"Down: Shutdown Wii.\n");
++	txtbox += _t("hkmline3", L"Left: Pause Wii.\n");
++	txtbox += _t("hkmline4", L"Right: Restart Wii.\n\n");
++	txtbox += _t("hkmline5", L"+: launch Channels (wiiware/vc/etc).\n\n");
++	txtbox += _t("hkmline6", L"A: continue original home key action.\n\n");
++	if( false==m_locked ) 
++	{
++	txtbox += _t("hkmline7", L"-: launch System Menu.\n");
++	txtbox += _t("hkmline8", L"1: launch HBC.\n");
++	txtbox += _t("hkmline9", L"2: launch Priiloader r69+\n\n");
++	}
++	txtbox += _t("hkmlinea", L"Home or B: Back.\n\n");
++	txtbox += _t("hkmlineb", L"Waiting key...\n");
++	m_btnMgr.setText(m_homeLblTextBox, txtbox, true);
++}
++
++s32 CMenu::get_title_dir(u32 dirhi, dirent_t *ent, u32 *cnt)
++{
++	s32 res;
++	u32 num = 0;
++	char path[ISFS_MAXPATH + 4];
++
++	if( NULL==cnt )
++		return -9;
++
++	snprintf(path, sizeof(path), "/title/%08x", dirhi);
++	res = ISFS_ReadDir(path, NULL, &num);
++	if(res != ISFS_OK)
++	{
++		error(sfmt("Error: ISFS_ReadDir path %s return %d\n", path, res));
++		return -1;
++	}
++
++	if( ent!=NULL && *cnt<num )
++	{
++		error(L"Error: not enough buffer size store return items!\n");
++		return -8;
++	}
++
++	*cnt = num;
++	if( ent==NULL || 0==num )
++		return 0;
++
++	char *nbuf = (char *)memalign(32, (ISFS_MAXPATH + 4) * num);
++
++	if(nbuf == NULL)
++	{
++		error(L"Error: alloc return NULL!\n");
++		return -2;
++	}
++
++	res = ISFS_ReadDir(path, nbuf, &num);
++	if(res != ISFS_OK)
++	{
++		SAFE_FREE(nbuf);
++		error(sfmt("Error: ISFS_ReadDir return %d\n", res));
++		return -3;
++	}
++	
++	char * p = nbuf;
++	for(u32 i = 0; i < num; i++)
++	{	    
++		memset(&(ent[i]), 0, sizeof(dirent_t));
++		strcpy(ent[i].dirname, p);
++		ent[i].id_hi = dirhi;
++		ent[i].id_lo = (u32) strtol(p, NULL, 16);
++		memcpy(ent[i].titleid, &(ent[i].id_lo), sizeof(ent[i].id_lo));
++		strupr(ent[i].titleid);
++		p += strlen(p) + 1;
++	}
++
++	SAFE_FREE(nbuf);
++	return 0;
++}
++
++s32 CMenu::get_apps(u32 dirhi, const char * tlo, dirent_t *ent, u32 *cnt)
++{
++	s32 res;
++	u32 num = 0;
++	char path[ISFS_MAXPATH];
++
++	if( NULL==cnt || NULL==tlo || 0==dirhi )
++		return -9;
++
++	snprintf(path, sizeof(path), "/title/%08x/%s/content", dirhi, tlo);
++	res = ISFS_ReadDir(path, NULL, &num);
++	if(res != ISFS_OK)
++	{
++		error(sfmt("Error: ISFS_ReadDir path %s return %d\n", path, res));
++		return -1;
++	}
++
++	if( ent!=NULL && *cnt<num )
++	{
++		error(L"Error: not enough buffer size store return items!\n");
++		return -8;
++	}
++
++	*cnt = num;
++	if( ent==NULL || 0==num )
++		return 0;
++
++	char *nbuf = (char *)memalign(32, ISFS_MAXPATH * num);
++
++	if(nbuf == NULL)
++	{
++		error(L"Error: alloc return NULL!\n");
++		return -2;
++	}
++
++	res = ISFS_ReadDir(path, nbuf, &num);
++	if(res != ISFS_OK)
++	{
++		SAFE_FREE(nbuf);
++		error(sfmt("Error: ISFS_ReadDir return %d\n", res));
++		return -3;
++	}
++	char * p = nbuf;
++	u32 c = 0;
++	for(u32 i = 0; i < num; i++)
++	{	    
++		if( strcasestr(p, ".APP") )
++		{
++			memset(&(ent[c]), 0, sizeof(dirent_t));
++			strncpy(ent[c].dirname, p, ISFS_MAXPATH);
++			ent[c].id_hi = dirhi;
++			c++;
++		}
++		p += strlen(p) + 1;
++	}
++
++	*cnt = c;
++	SAFE_FREE(nbuf);
++	return 0;
++}
++
++void CMenu::get_hrname(dirent_t * t, u32 number, Config & titles)
++{
++	if( titles.loaded() )
++	{
++		string phrname(titles.getString("TITLES", t->titleid));
++		if( !phrname.empty() )
++		{
++			strncpy(t->hrname, phrname.c_str(), 64/* TITLE_MAX */);
++			return;
++		}
++	}
++
++	s32 ret;
++	char path[ISFS_MAXPATH];
++	u8 hrname[HR_NAMELEN];
++	u8 * buf = (u8 *) memalign(32, HR_BUFF_LEN+16);
++	dirent_t * applst = (dirent_t *) memalign(32, sizeof(dirent_t) * (number+4));
++
++	if( buf==NULL || NULL==applst )
++	{
++		error(L"Error: alloc buf return NULL!\n");
++		return;
++	}
++
++	memset(buf, 0, HR_BUFF_BLEN);
++	snprintf(path, sizeof(path), "/title/%08x/%s/data/banner.bin", t->id_hi, t->dirname);
++	s32 cfd = ISFS_Open(path, ISFS_OPEN_READ);
++	if( cfd>=0 )
++	{
++		ret = ISFS_Read(cfd, buf, HR_BUFF_BLEN);
++		usleep(1000);
++		ISFS_Close(cfd);
++		if( ret > (s32) 0x21 )
++		{
++			u32 idx = 0; 
++			s32 loc;
++			memset(hrname, 0, sizeof(hrname));
++			for( loc = 0x21; loc < ret && loc < HR_BUFF_BLEN && buf[loc] && idx<254; loc +=2 )
++				hrname[idx++] = buf[loc];
++			if( idx )
++			{
++				strncpy(t->hrname, (char*)hrname, sizeof(hrname));
++				SAFE_FREE(applst);
++				SAFE_FREE(buf);
++				return;
++			}
++		}
++		else
++		{
++			error(sfmt("Error: ISFS_Read return %d\n", ret));
++		}
++	}
++
++	u32 capp = number;
++	ret = get_apps(t->id_hi, t->dirname, applst, &capp);
++
++	if( 0==ret && capp>0 )
++	{
++		u32 j;
++		for( j=0; j<capp; j++ )
++		{
++			memset(buf, 0, HR_BUFF_LEN);
++			snprintf(path, sizeof(path), "/title/%08x/%s/content/%s", t->id_hi, t->dirname, applst[j].dirname);
++			s32 cfd2 = ISFS_Open(path, ISFS_OPEN_READ);
++			if( cfd2>=0 )
++			{
++				ret = ISFS_Read(cfd2, buf, HR_BUFF_LEN);
++				usleep(1000);
++				ISFS_Close(cfd2);
++				if( ret>241 )
++				{
++					if( 0==memcmp(&(buf[0x80]), "IMET", 4) )
++					{
++						u32 idx = 0; 
++						s32 loc;
++						memset(hrname, 0, sizeof(hrname));
++						for( loc=0xf1; loc<ret && loc<HR_BUFF_LEN && buf[loc] && idx<254; loc +=2 )
++							hrname[idx++] = buf[loc];
++						if( idx )
++						{
++							strncpy(t->hrname, (char*)hrname, sizeof(hrname));
++							SAFE_FREE(applst);
++							SAFE_FREE(buf);
++							return;
++						}
++					}
++				}
++			}
++			else error(sfmt("Error: ISFS_Open %s.\n", path));
++		}
++	}
++	else 
++		error(sfmt("Error: get_apps get count %d %u failed.", ret, capp));
++	SAFE_FREE(applst);
++	SAFE_FREE(buf);
++}
++
++s32 CMenu::get_channel_list(channel_list_t & chlist)
++{
++	s32 ret;
++	u32 maxnum1 = 0;
++	u32 maxnum2 = 0;
++	chlist.clear();
++
++	ret = get_title_dir(0x00010001, NULL, &maxnum1);
++	if( 0!=ret )
++	{
++		error(L"Error: unable to open dir1 or no file in dir.\n");
++		return ret;
++	}
++	ret = get_title_dir(0x00010002, NULL, &maxnum2);
++	if( 0!=ret )
++	{
++		error(L"Error: unable to open dir2 or no file in dir.\n");
++		return ret;
++	}
++
++	u32 tmpnum = maxnum1+maxnum2;
++	if( 0==tmpnum )
++	{
++		error(L"Error: 0 item!\n");
++		return -7;
++	}
++	
++	dirent_t * tmplist = (dirent_t *) memalign(32, sizeof(dirent_t) * tmpnum);
++	if( NULL==tmplist )
++	{
++		error(L"Error: alloc return NULL!\n");
++		return -2;
++	}
++	memset(tmplist, 0, sizeof(dirent_t) * tmpnum);
++
++	if( maxnum1>0 )
++	{
++		ret = get_title_dir(0x00010001, tmplist, &maxnum1);
++		if( ret != 0)
++		{
++			SAFE_FREE(tmplist);
++			error(L"Error Reading folder dir1 failed.\n");
++			return ret;
++		}
++	}
++	if( maxnum2>0 )
++	{
++		ret = get_title_dir(0x00010002, &(tmplist[maxnum1]), &maxnum2);
++		if( ret != 0)
++		{
++			SAFE_FREE(tmplist);
++			error(L"Error Reading folder dir2 failed.\n");
++			return ret;
++		}
++	}
++
++	u32 number, i;
++    char path[ISFS_MAXPATH];
++	Config titles;
++	titles.load(sfmt("%s/titles.ini", m_dataDir.c_str()).c_str());	
++
++	for( i = 0; i < tmpnum; i++ )
++	{	
++		dirent_t * t = &(tmplist[i]);
++		snprintf(path, sizeof(path), "/title/%08x/%s/content", t->id_hi, t->dirname);
++		number = 0;
++		ret = ISFS_ReadDir(path, NULL, &number);	
++		if( ISFS_OK==ret && number>1 )
++		{
++			get_hrname(t, number, titles);
++//			printf("%x [%s]%s\n", t->id_hi, t->titleid, t->hrname);
++//			error(sfmt("%x [%s]%s\n", t->id_hi, t->titleid, t->hrname));
++			chlist.push_back( *t );
++		}
++	}
++
++	SAFE_FREE(tmplist);
++	return 0;
++}
++
++void CMenu::filter_channel_list(channel_list_t & chlist)
++{
++	Config channels;
++	channels.load(sfmt("%s/channels.ini", m_dataDir.c_str()).c_str());	
++	if( !channels.loaded() )
++		return;
++again:
++	channel_list_t::iterator ich = chlist.begin();
++	for( ; ich != chlist.end(); ich++ )
++	{
++		int v = channels.getInt("CHANNELS", ich->titleid, 99);
++		if( 0==v || ( m_locked && 1==v ) )
++		{
++			chlist.erase( ich );
++			goto again;
++		}
++	}
++}
++
++u64 CMenu::show_channel_menu(channel_list_t & chlist)
++{
++	// init page line string
++	wchar_t linestr[9][HR_NAMELEN];
++	wcsncpy(linestr[0], _t("chmline1", L"U: [%s] %s\n").c_str(), HR_NAMELEN);
++	wcsncpy(linestr[1], _t("chmline2", L"D: [%s] %s\n").c_str(), HR_NAMELEN);
++	wcsncpy(linestr[2], _t("chmline3", L"L: [%s] %s\n").c_str(), HR_NAMELEN);
++	wcsncpy(linestr[3], _t("chmline4", L"R: [%s] %s\n").c_str(), HR_NAMELEN);
++	wcsncpy(linestr[4], _t("chmline5", L"A: [%s] %s\n").c_str(), HR_NAMELEN);
++	wcsncpy(linestr[5], _t("chmline6", L"B: [%s] %s\n").c_str(), HR_NAMELEN);
++	wcsncpy(linestr[6], _t("chmline7", L"1: [%s] %s\n").c_str(), HR_NAMELEN);
++	wcsncpy(linestr[7], _t("chmline8", L"2: [%s] %s\n").c_str(), HR_NAMELEN);
++	wcsncpy(linestr[8], _t("chmline9", L"-: [%s] %s\n").c_str(), HR_NAMELEN);
++	const u32 dfbtn[11] = { WPAD_BUTTON_UP, WPAD_BUTTON_DOWN, WPAD_BUTTON_LEFT, WPAD_BUTTON_RIGHT,
++		WPAD_BUTTON_A, WPAD_BUTTON_B, WPAD_BUTTON_1, WPAD_BUTTON_2,
++		WPAD_BUTTON_MINUS, WPAD_BUTTON_PLUS, WPAD_BUTTON_HOME };
++
++	u32 cpage=0, btn = 0, i;
++	const u32 cnt = (u32) chlist.size();
++	const u32 mpage=cnt/9 + 1;
++	wstringEx txtbox;
++	bool drawtxt = true;
++	bool quit = false;
++	u64 ret64 = 0;
++
++	WPAD_Rumble(WPAD_CHAN_0, 0);
++	_setBg(m_homeBg, m_homeBg);
++//	_textHomeKeyMenu();
++	m_btnMgr.setText(m_homeLblTitle, _t("launchchannel", L"Launch Channel"), true);
++	m_btnMgr.setText(m_homeLblTextBox, L"", true);
++	m_btnMgr.show(m_homeLblTitle);
++	m_btnMgr.show(m_homeLblTextBox);
++	
++	do
++	{
++		//show menu
++		if( drawtxt )
++		{
++			drawtxt = false;
++			u32 cur = cpage*9;
++			txtbox = _t("chmlinea",L"Home: exit\n\n");
++			for( i=0; i<9 && cur<cnt; ++i, ++cur )
++			{
++				txtbox += wfmt(linestr[i], chlist[cur].titleid, chlist[cur].hrname );
++			}
++			txtbox += L"\n\n";
++			txtbox += wfmt(_t("chmlineb", L"+: next page      Page: %u / %u\n"), cpage+1, mpage);
++			m_btnMgr.setText(m_homeLblTextBox, txtbox, true);
++		}
++
++		WPAD_ScanPads();
++		s32 padsState = WPAD_ButtonsDown(0);
++		WPADData * wd = WPAD_Data(0);
++		more_input_scan(padsState, btn);
++		for( i=0; i<11 && padsState; ++i )
++			if( padsState & dfbtn[i] )
++			{
++				if( dfbtn[i]==WPAD_BUTTON_PLUS )
++				{
++					cpage = (cpage + 1) % mpage;
++					drawtxt = true;
++					break;
++				}
++				else if( dfbtn[i]==WPAD_BUTTON_HOME )
++				{
++					quit = true;
++					break;
++				}
++				const u32 cloc = cpage*9+i;
++				if( cloc < cnt )
++				{
++					ret64 = (u64)(chlist[cloc].id_hi)<<32 | chlist[cloc].id_lo;
++					quit = true;
++					break;
++				}
++			}
++		_mainLoopCommon(wd);
++	}while( false==quit );
++	WPAD_Rumble(WPAD_CHAN_0, 0);
++	_hideHomeKeyMenu(false);
++	return ret64;
++}
++
++bool CMenu::_run_channel_menu(void)
++{
++	u64 tid = 0;
++	channel_list_t chlist;
++
++	ISFS_Initialize();
++	get_channel_list(chlist);
++	ISFS_Deinitialize();
++
++	if( chlist.size() )
++	{
++		filter_channel_list(chlist);
++		if( chlist.size() )
++		{
++			tid = show_channel_menu(chlist);
++		}
++		else
++		{
++			error(_t("channelerr",L"Error: Channel list is empty. Press any key continue...\n"));
++		}
++	}
++
++	if( tid )
++	{
++		//run_title(tid);
++		gp_tid = tid;
++		exit_action = HKM_RUN_TITLE;
++		return true;
++	}
++	return false;
++}
++
++void Wpad_off(void)
++{
++	for(u32 i=0; i<4; ++i)
++		WPAD_Disconnect(i);
++	WPAD_Shutdown();
++}
++
++void run_title(void)
++{
++	u64 tid = gp_tid;
++	if( 0==tid )
++		return;
++	WII_Initialize();
++	usleep(1000);
++	s32 ret = WII_LaunchTitle( tid );
++	if( ret<0 )
++		return;
++	exit(0);
++}
++
++int Exit_task(int retcode)
++{
++	Wpad_off();
++//	KEYBOARD_Deinit();
++	switch(exit_action)
++	{
++	case HKM_REBOOT:
++		Sys_Reboot();
++		break;
++	case HKM_IDLE:
++		Sys_Shutdown();
++		break;
++	case HKM_SHUTDOWN:
++		STM_ShutdownToStandby();
++		break;
++	case HKM_HBC:
++		WII_Initialize();
++	    WII_LaunchTitle(0x000100014A4F4449LL); // JODI
++	    WII_LaunchTitle(0x0001000148415858LL); // HAXX
++		break;
++	case HKM_RUN_TITLE:
++		run_title();
++		break;
++	case HKM_NOTHING:
++	default:
++		break;
++	}
++	return retcode;
++}
++
++u32 GetReturnTo(void)
++{
++	return rtid_;
++}
++
+diff -ruwN wiiflow-r42/source/menu/menu_main.cpp wiiflow-r42-book-mod-r7/source/menu/menu_main.cpp
+--- wiiflow-r42/source/menu/menu_main.cpp	Thu Mar 18 19:10:57 2010
++++ wiiflow-r42-book-mod-r7/source/menu/menu_main.cpp	Sun May  2 18:26:43 2010
+@@ -69,7 +69,7 @@
+ {
+ 	s32 padsState;
+ 	WPADData *wd;
+-	u32 btn;
++	u32 btn = 0;
+ 	wstringEx curLetter;
+ 	int repeatButton = 0;
+ 	u32 buttonHeld = (u32)-1;
+@@ -99,7 +99,7 @@
+ 		WPAD_ScanPads();
+ 		padsState = WPAD_ButtonsDown(0);
+ 		wd = WPAD_Data(0);
+-		btn = _btnRepeat(wd->btns_h);
++		more_input_scan(padsState, btn);
+ 		//Get Nunchuk values
+ 		angle = wd->exp.nunchuk.js.ang;
+ 		mag = wd->exp.nunchuk.js.mag;
+@@ -114,6 +114,9 @@
+ 		if ((padsState & WPAD_BUTTON_HOME) != 0)
+ 		{
+ 			reload = (wd->btns_h & WPAD_BUTTON_B) != 0;
++			if( reload )
++				break;
++			if( _home_key_menu() )
+ 			break;
+ 		}
+ 		if (wd->ir.valid)
+@@ -173,7 +176,10 @@
+ 			if (buttonHeld != m_btnMgr.selected())
+ 				m_btnMgr.click();
+ 			if (m_btnMgr.selected() == m_mainBtnQuit)
++			{
++				if( _home_key_menu() )
+ 				break;
++			}
+ 			else if (m_btnMgr.selected() == m_mainBtnInit)
+ 			{
+ 				_hideMain();
+diff -ruwN wiiflow-r42/source/menu/menu_wbfs.cpp wiiflow-r42-book-mod-r7/source/menu/menu_wbfs.cpp
+--- wiiflow-r42/source/menu/menu_wbfs.cpp	Fri Mar 12 00:34:01 2010
++++ wiiflow-r42-book-mod-r7/source/menu/menu_wbfs.cpp	Mon Apr  5 03:46:01 2010
+@@ -143,7 +143,7 @@
+ 		WPAD_ScanPads();
+ 		padsState = WPAD_ButtonsDown(0);
+ 		wd = WPAD_Data(0);
+-		btn = _btnRepeat(wd->btns_h);
++		more_input_scan(padsState, btn);
+ 		if ((padsState & (WPAD_BUTTON_HOME | WPAD_BUTTON_B)) != 0 && !m_thrdWorking)
+ 			break;
+ 		if (wd->ir.valid)
+diff -ruwN wiiflow-r42/wii/wiiflow/channels.ini wiiflow-r42-book-mod-r7/wii/wiiflow/channels.ini
+--- wiiflow-r42/wii/wiiflow/channels.ini	Thu Jan  1 08:00:00 1970
++++ wiiflow-r42-book-mod-r7/wii/wiiflow/channels.ini	Mon Apr 19 13:16:41 2010
+@@ -0,0 +1,25 @@
++[COMMAND]
++# 设置要返回的频道的Title ID，不再需要priiloader支持即可退出游戏是返回指定频道，
++# 注意不能是系统频道，如天气，照片等等。只能是各种用WAD安装的游戏频道及Forwarder等。
++# 不知道频道的Title ID，可以先运行wiiflow book mod并按[Home +]查看，并记录下来，再
++# 修改本文文件 return_to_title_id = 四位的频道Title ID，下面是例子。
++# 注意需要去掉开头的#号方可生效。
++
++#return_to_title_id = WFXF
++
++[CHANNELS]
++# Dont work channel on my wii
++# 要屏蔽的设为0
++SNEX = 0
++HAAA = 0
++# Only admin can access wii shop channel
++# 家长可访问的频道设为0，不设或者设为0,1之外的值表示对所有人可见的频道
++HABA = 1
++HABE = 1
++HABJ = 1
++HABK = 1
++HABC = 1
++HABP = 1
++# Homebrew Channel, only admin can access
++#　屏蔽HBC频道
++JODI = 1
+diff -ruwN wiiflow-r42/wii/wiiflow/language.ini wiiflow-r42-book-mod-r7/wii/wiiflow/language.ini
+--- wiiflow-r42/wii/wiiflow/language.ini	Wed Mar 31 05:01:51 2010
++++ wiiflow-r42-book-mod-r7/wii/wiiflow/language.ini	Wed Mar 31 09:49:52 2010
+@@ -7,7 +7,8 @@
+ # ES : Spanish
+ # IT : Italian
+ # NL : Dutch
+-# ZH : Chinese
++# ZH : S.Chinese
++# TC : T.Chinese
+ # KO : Korean
+ # FR : French
+ 
+@@ -275,7 +276,7 @@
+ wbfsremdlg=Para remover permanentemente o jogo : %s, clique em Ir.
+ wiitdb_code=EN
+ 
+-[Chinese]
++[S.Chinese]
+ about1=程序设计: %s
+ about2=图形设计: %s
+ about3=感谢 :\n\n%s%s%s\n\n%s\n%s
+@@ -326,10 +327,16 @@
+ cfgg7=Vipatch
+ cfgg8=返回
+ cfgg9=DOL
++cfgp1=游戏分区
++cfgp2=安装到目录
+ cfgs1=音乐音量
+ cfgs2=图形模式音量
+ cfgs3=Coverflow音量
+ cfgs4=游戏音量
++cheat1=后退
++cheat2=应用
++cheat3=文件未找到
++cheat4=下载未找到
+ def=缺省
+ dl1=取消
+ dl10=请捐赠\nto WiiTDB.com
+@@ -389,7 +396,7 @@
+ wbfs2=WBFS_Open 失败 : %i
+ wbfs3=WBFS_GetCount 失败 : %i
+ wbfs4=WBFS_GetHeaders 失败 : %i
+-wbfsadddlg=插入需要复制到光盘，然后点击开始.
++wbfsadddlg=插入要安装的游戏光盘，然后点击开始.
+ wbfsop1=安装游戏
+ wbfsop10=空间不足: %i 需要空间, %i 可用
+ wbfsop2=删除游戏
+@@ -406,6 +413,194 @@
+ wbfsprogress=%i%%
+ wbfsremdlg=永久删除游戏 : %s, click on Go.
+ wiitdb_code=ZH
++homekeymenu=Home按键菜单
++hkmline1=上: 家长解锁/加锁\n
++hkmline2=下: Wii 关机\n
++hkmline3=左: Wii 待机\n
++hkmline4=右: 重启 Wii\n\n
++hkmline5=+ : 运行频道 (wiiware/vc/其他)\n\n
++hkmline6=A : 继续原本home键操作\n\n
++hkmline7=- : 启动系统菜单\n
++hkmline8=1 : 启动 HBC\n
++hkmline9=2 : 配置 Priiloader 0.3c(r69)以上版本\n\n
++hkmlinea=Home 或 B: 放弃操作，返回CFG UL\n\n
++hkmlineb=请选择按键...\n
++launchchannel=启动频道程序
++chmline1=上: [%s] %s\n
++chmline2=下: [%s] %s\n
++chmline3=左: [%s] %s\n
++chmline4=右: [%s] %s\n
++chmline5=A : [%s] %s\n
++chmline6=B : [%s] %s\n
++chmline7=1 : [%s] %s\n
++chmline8=2 : [%s] %s\n
++chmline9=- : [%s] %s\n
++chmlinea=Home: 退出\n\n
++chmlineb=+ : 下一页      页数: %u / %u\n
++channelerr=频道列表为空。按任意键继续。。。\n
++
++[T.Chinese]
++about1=程式設計: %s
++about2=圖形設計: %s
++about3=感謝 :\n\n%s%s%s\n\n%s\n%s
++appname=%s v%s
++cd1=返回
++cd2=清除
++cfg1=設置
++cfg10=返回
++cfg11=振動
++cfg2=3D 封面
++cfg3=下載封面和標題文檔
++cfg4=下載
++cfg5=家長控制
++cfg6=解鎖
++cfg7=設置代碼
++cfga2=安裝遊戲
++cfga3=安裝
++cfga6=語言
++cfga7=主題
++cfgb1=金手指
++cfgb2=Vipatch
++cfgb3=預設影像模式
++cfgb4=預設遊戲語言
++cfgc1=回到Wii選單
++cfgc2=調整寬度
++cfgc3=調整高度
++cfgc4=調整Coverflow
++cfgc5=進入
++cfgc6=垂直偏移
++cfgc7=水平偏移
++cfgd1=國家代碼修復
++cfgd2=002 錯誤修復
++cfgd3=保留PNG文件
++cfgd4=壓縮文本
++cfgd5=收藏模式保存狀態
++cfgd6=預設搜索模式
++cfgg1=設置
++cfgg10=IOS
++cfgg11=封鎖IOS再讀取
++cfgg12=下載封面
++cfgg13=下載
++cfgg14=影像模式修正
++cfgg2=影像模式
++cfgg3=語言
++cfgg4=國家代碼修復
++cfgg5=金手指
++cfgg6=002錯誤修復
++cfgg7=Vipatch
++cfgg8=返回
++cfgg9=DOL
++cfgp1=遊戲磁區
++cfgp2=安裝到目錄
++cfgs1=音樂音量
++cfgs2=圖形模式音量
++cfgs3=Coverflow音量
++cfgs4=遊戲音量
++cheat1=後退
++cheat2=應用
++cheat3=檔案未找到
++cheat4=下載未找到
++def=預設
++dl1=取消
++dl10=請捐贈\nto WiiTDB.com
++dl2=返回
++dl3=全部
++dl4=無封面
++dl5=下載
++dl6=全部
++dl7=無封面
++dl8=封面
++dl9=遊戲標題
++dlmsg1=偵測網路...
++dlmsg10=製作中 %s
++dlmsg11=下載中...
++dlmsg12=下載失敗
++dlmsg13=保存中...
++dlmsg14=完成。
++dlmsg15=不能保存成Zip文件
++dlmsg16=不能讀取文件
++dlmsg2=網路偵測失敗
++dlmsg3=下載來自 %s
++dlmsg4=保存 %s
++dlmsg5=%i/%i 文件已下載
++dlmsg6=取消...
++dlmsg7=列出需要下載的封面...
++dlmsg8=Full cover 沒發現. 下載來自 %s
++dlmsg9=%i/%i 文件已下載. %i 是2D封面類型。
++gm1=開始
++gm2=返回
++lngdef=缺省
++lngdut=荷蘭語
++lngeng=英語
++lngfre=法語
++lngger=德語
++lngita=意大利語
++lngjap=日語
++lngkor=朝鮮語
++lngsch=簡體中文
++lngspa=西班牙語
++lngtch=繁體中文
++main1=設置
++main2=歡迎使用Wiiflow. 沒有找到遊戲.點擊設置來安裝遊戲.
++off=關閉
++on=開啟
++smalpha=字符
++smpage=頁碼
++translation_author=Kavid
++viddef=預設
++vidntsc=NTSC
++vidp50=PAL 50Hz
++vidp60=PAL 60Hz
++vidpatch=自動修正
++vmpall=全部
++vmpmore=更多
++vmpnone=無
++vmpnormal=正常
++wbfs2=WBFS_Open 失敗 : %i
++wbfs3=WBFS_GetCount 失敗 : %i
++wbfs4=WBFS_GetHeaders 失敗 : %i
++wbfsadddlg=放入欲安裝的遊戲光碟，然後點擊開始.
++wbfsop1=安裝遊戲
++wbfsop10=空間不足: %i 需要空間, %i 可用
++wbfsop2=刪除遊戲
++wbfsop4=返回
++wbfsop5=開始
++wbfsop6=安裝中 [%s] %s...
++wbfsop7=遊戲已刪除
++wbfsop8=遊戲已安裝
++wbfsop9=出現一個錯誤
++wbfsoperr1=Disc_Wait 失敗
++wbfsoperr2=Disc_Open 失敗
++wbfsoperr3=這不是Wii光碟
++wbfsoperr4=遊戲已安裝
++wbfsprogress=%i%%
++wbfsremdlg=永久刪除遊戲 : %s, click on Go.
++wiitdb_code=TC
++homekeymenu=Home按鍵選單
++hkmline1=上: 家長解鎖/加鎖\n
++hkmline2=下: Wii 關機\n
++hkmline3=左: Wii 待機\n
++hkmline4=右: 重啟 Wii\n\n
++hkmline5=+ : 運行頻道 (wiiware/vc/其他)\n\n
++hkmline6=A : 繼續原本home鍵操作\n\n
++hkmline7=- : 啟動系統選單\n
++hkmline8=1 : 啟動 HBC\n
++hkmline9=2 : 配置 Priiloader 0.3c(r69)以上版本\n\n
++hkmlinea=Home 或 B: 放棄操作，返回CFG UL\n\n
++hkmlineb=請選擇按鍵...\n
++launchchannel=啟動頻道程式
++chmline1=上: [%s] %s\n
++chmline2=下: [%s] %s\n
++chmline3=左: [%s] %s\n
++chmline4=右: [%s] %s\n
++chmline5=A : [%s] %s\n
++chmline6=B : [%s] %s\n
++chmline7=1 : [%s] %s\n
++chmline8=2 : [%s] %s\n
++chmline9=- : [%s] %s\n
++chmlinea=Home: 退出\n\n
++chmlineb=+ : 下一頁      頁數: %u / %u\n
++channelerr=頻道列表為空。按任意鍵繼續。。。\n
+ 
+ [DANISH]
+ about1=Loader af %s
+@@ -1558,7 +1753,8 @@
+ cheat1=Indietro
+ cheat2=Applica
+ cheat3=File trucchi del gioco non trovato
+-cheat4=Download non trovatodef=Predefinita
++cheat4=Download non trovato
++def=Predefinita
+ dl1=Annulla
+ dl10=Si invita a fare una\ndonazione a WiiTDB.com
+ dl2=Indietro
+diff -ruwN wiiflow-r42/wii/wiiflow/titles.ini wiiflow-r42-book-mod-r7/wii/wiiflow/titles.ini
+--- wiiflow-r42/wii/wiiflow/titles.ini	Tue Oct  6 16:11:48 2009
++++ wiiflow-r42-book-mod-r7/wii/wiiflow/titles.ini	Mon Apr 19 03:26:22 2010
+@@ -1,1714 +1,2689 @@
+ 
+ [TITLES]
+-c80p52=Guitar Hero III Custom: GH I & 80's
+-cg1p52=Guitar Hero III Custom: GH I
+-cg2e52=Guitar Hero III Custom: GH II
+-cg2p52=Guitar Hero III Custom: GH II
+-cgbp52=Guitar Hero III Custom: Rock Band
+-r24j01=Chibi-Robo!
+-r29e52=NPPL Championship Paintball 2009
+-r29p52=Millenium Series Championship Paintball 2009
+-r2ae7d=Ice Age 2: The Meltdown
+-r2ap7d=Ice Age 2: The Meltdown
+-r2ax7d=Ice Age 2: The Meltdown
+-r2deap=Dokapon Kingdom
+-r2djep=Dokapon Kingdom For Wii
+-r2dpap=Dokapon Kingdom
+-r2ej99=Fish Eyes Wii
+-r2fe5g=Freddi Fish: Kelp Seed Mystery
+-r2fp70=Freddi Fish: Kelp Seed Mystery
+-r2gjaf=Fragile: Sayonara Tsuki no Haikyo
+-r2he41=Petz Horse Club
+-r2ie69=Madden NFL 10
+-r2ip69=Madden NFL 10
+-r2jjaf=Taiko no Tatsujin Wii
+-r2ke54=Don King Boxing
+-r2kp54=Don King Boxing
+-r2ljms=Hula Wii: Minna De Fura Oodorou
+-r2me20=M&M's Adventure
+-r2ne69=NASCAR Kart Racing
+-r2np69=NASCAR Kart Racing
+-r2pe9b=Super Swing Golf Season 2
+-r2pj9b=Super Swing Golf Season 2
+-r2pkz4=Super Swing Golf Season 2
+-r2pp99=Super Swing Golf
+-r2qjc0=Cooking Mama 2 Taihen Mama Wa Ooisogashi
+-r2sj18=Deca Sporta 2
+-r2sp18=Sports Island 2
+-r2ue8p=Let's TAP
+-r2uj8p=Let's Tap
+-r2up8p=Let's Tap
+-r2wea4=Pro Evolution Soccer 2009
+-r2wja4=Winning Eleven Playmaker 2009
+-r2wpa4=Pro Evolution Soccer 2009
+-r2wxa4=Pro Evolution Soccer 2009
+-r2ye54=Birthday Party Bash
+-r2yp54=It's my Birthday!
+-r32j01=Metroid Prime 2
+-r33e69=AC/DC Live: Rock Band Track Pack
+-r33p69=AC/DC Live: Rock Band Song Pack
+-r34e69=Rock Band Country Track Pack
+-r35jc8=Sangokushi 11 With Power Up Kit
+-r3ae20=Story Hour: Adventures
+-r3ap20=Story Hour: Adventures
+-r3ap7j=Story Hour: Adventures
+-r3be8p=Samba De Amigo
+-r3bj8p=Samba De Amigo
+-r3bp8p=Samba De Amigo
+-r3ce20=Chrysler Classic Racing
+-r3cp20=Chrysler Classic Racing
+-r3des5=Dream Pinball 3D
+-r3dps5=Dream Pinball
+-r3fja4=Jikkyou Powerful Major League 3
+-r3gxug=Kidz Sports Crazy Mini Golf
+-r3hp6z=Agent Hugo: Hula Holiday
+-r3ij01=Metroid Prime
+-r3je5g=Go Play Circus Star
+-r3me01=Metroid Prime: Trilogy
+-r3mp01=Metroid Prime: Trilogy
+-r3nexs=Guilty Gear XX Accent Core Plus
+-r3pewr=Speed Racer: The Videogame
+-r3pj52=Speed Racer
+-r3ppwr=Speed Racer
+-r3se52=Spider-Man: Web of Shadows
+-r3sp52=Spider-Man: Web of Shadows
+-r3te54=Top Spin 3
+-r3tp54=Top Spin 3
+-r3vefp=Deer Drive
+-r3vpfp=Deer Drive
+-r3xe6u=Sam & Max: Season One
+-r3xp6v=Sam & Max: Season One
+-r3ze69=Rock Band Classic Rock Track Pack
+-r42e69=The Sims 2: Castaway
+-r42p69=Sims 2: Castaway
+-r43e69=EA Sports Active
+-r43j13=EA SPORTS Active Personal Trainer Wii 30-Hi Seikatsu Kaizen Program
+-r43p69=EA Sports Active: Personal Trainer
+-r44j8p=Suzumiya Haruhi no Heiretsu
+-r46ens=Phantom Brave: We Meet Again
+-r46jkb=Phantom Brave Wii
+-r47e20=ATV Quad Kings
+-r48e7d=The Spiderwick Chronicles
+-r48p7d=The Spiderwick Chronicles
+-r49e01=Donkey Kong: Jungle Beat
+-r49j01=Donkey Kong: Jungle Beat
+-r49p01=Donkey Kong Jungle Beat
+-r4ae69=SimAnimals
+-r4aj13=Sim Animals
+-r4ap69=Sim Animals
+-r4bejz=Championship Foosball
+-r4bpgt=Table Football
+-r4ce69=SimCity Creator
+-r4cj13=Simcity Creator
+-r4ck69=SimCity Creator
+-r4cp69=Simcity Creator
+-r4fe20=Story Hour: Fairy Tales
+-r4fp20=Story Hour: Fairy Tales
+-r4fp7j=Story Hour&nbsp;:&nbsp;Fairy Tales
+-r4lxug=Athletic Piggy Party
+-r4mj0q=Shikakumaruwii
+-r4ne5g=Major Minor's Majestic March
+-r4np5g=Major Minor's Majestic March
+-r4pe69=The Sims 2: Pets
+-r4pp69=The Sims 2: Pets
+-r4qe01=Mario Strikers Charged
+-r4qj01=Mario Strikers Charged
+-r4qp01=Mario Strikers Charged Football
+-r4se54=MLB Superstars
+-r4vjaf=Tere Shibai Wii
+-r4wja4=Jikkyou Powerful Major League 2009
+-r4zj01=Project Zero 4: Mask of the Lunar Eclipse
+-r52e08=Neopets Puzzle Adventure
+-r52p08=Neopets Puzzle Adventure
+-r55f41=Qui Veut Gagner Des Millions: 1ère Edition
+-r55p41=Who Wants To Be A Millionaire
+-r5ae8p=The Golden Compass
+-r5ap8p=The Golden Compass
+-r5fp41=Academy of Champions: Football
+-r5ge78=Are You Smarter than a 5th Grader: Make the Grade
+-r5jes5=Pirates vs. Ninjas Dodgeball
+-r5jps5=Pirates vs Ninjas Dodgeball
+-r5mjaf=Kotoba No Puzzle Mojipittan Wii Deluxe
+-r5njn9=Doala De Wii
+-r5oenr=Party Pigs: Farmyard Games
+-r5oxug=Farmyard Party
+-r5pe69=Harry Potter and the Order of the Phoenix
+-r5pj13=Harry Potter and the Order of the Phoenix
+-r5pp69=Harry Potter and the Order of the Phoenix
+-r5px69=Harry Potter and the Order of the Phoenix
+-r5serw=Mortimer Beckett and the Secrets of Spooky Manor
+-r5sprw=Mortimer Beckett and The Secrets of Spooky Manor
+-r5te69=Grand Slam Tennis
+-r5tj13=Grand Slam Tennis
+-r5tp69=Grand Slam Tennis
+-r62pgt=Guilty Gear XX
+-r64e01=Wii Music
+-r64j01=Wii Music
+-r64p01=Wii Music
+-r6be78=de Blob
+-r6bj78=Blob Colorful Na Kibou
+-r6bk78=de Blob
+-r6bp78=de Blob
+-r6bx78=de Blob
+-r6dfjw=Warning: Code De La Route
+-r6fers=Six Flags Fun Park
+-r6fp41=Fun Park Party
+-r6gpmr=Golden Balls
+-r6kp36=Ashes Cricket 2009
+-r6ve4z=King of Clubs
+-r6vp4z=King Of Clubs
+-r6vpgn=King of clubs
+-r6we68=AMF Bowling World Lanes
+-r6wp68=AMF Bowling World Lanes
+-r72e5g=Cake Mania: In The Mix!
+-r72p5g=Cake Mania: In The Mix
+-r77jaf=SD GUNDAM G Generation Wars
+-r79jaf=Mobile Suit Gundam: MS Sensen 0079
+-r7bp7j=Jelly Belly Ballistic Beans
+-r7ce01=Captain ★ Rainbow
+-r7cj01=Captain ★ Rainbow
+-r7cp01=Captain ★ Rainbow
+-r7ee8p=NiGHTS: Journey of Dreams
+-r7ej8p=Nights Journey Of Dreams
+-r7ep8p=NiGHTS: Journey of Dreams
+-r7fegd=Final Fantasy Fables: Chocobo's Dungeon
+-r7fjgd=Final Fantasy Fables: Chocobo's Dungeon
+-r7fpgd=Final Fantasy Fables: Chocobo's Dungeon
+-r7gjaf=Dragon Ball: Tenkaichi Daibouken
+-r7pe01=Punch-Out!!
+-r7pj01=Punch-Out!!
+-r7pp01=Punch-Out!!
+-r7re52=Little League World Series Baseball 2009
+-r7se5g=Escape The Museum
+-r7sp5g=Escape The Museum
+-r82jg0=Darts Wii DX
+-r83ja4=Pop'n Music
+-r84ee9=Harvest Moon: Tree Of Tranquility
+-r84j99=Bokujo for Wii
+-r8be41=Imagine Party Babyz
+-r8bp41=Babysitting Party
+-r8fpnp=Fast Food Panic
+-r8gjc8=G1 Jockey Wii 2008
+-r8gpc8=G1 Jockey 2008
+-r8he4q=Hannah Montana: The Movie
+-r8hp4q=Hannah Montana: The Movie
+-r8hy4q=Hannah Montana: The Movie
+-r8njg0=Batting Revolution
+-r8pe01=Super Paper Mario
+-r8pj01=Super Paper Mario
+-r8pk01=Super Paper Mario
+-r8pp01=Super Paper Mario
+-r8se41=Vacation Sports
+-r8sp41=World Sports Party
+-r8tenr=Tournament Pool
+-r8ve41=Petz Rescue: Wildlife Vet
+-r8vp41=Planet Rescue: Wildlife Vet
+-r8ze8p=Daisy Fuentes Pilates
+-r92j01=Pikmin 2
+-r92p01=Pikmin 2
+-r96eaf=Klonoa
+-r96jaf=Kaze no Klonoa Door to Phantomile
+-r96paf=Klonoa
+-r9bpmt=Bob the Builder: Festival of Fun
+-r9fp7j=Sudoku Ball - Detective
+-r9ie01=Pikmin
+-r9ij01=Pikmin
+-r9ip01=Pikmin
+-r9jp69=The Beatles: Rock Band
+-r9ke20=Groovin' Blocks
+-r9mpfr=Summer Athletics 2009
+-r9oe69=Tiger Woods PGA Tour 10
+-r9op69=Tiger Woods PGA Tour 10
+-r9rpng=Dance Party Pop Hits
+-r9sppl=Sudoku Ball - Detective
+-r9te69=Tiger Woods PGA Tour 09 All-Play
+-r9tj13=Tiger Woods PGA Tour 09 All-Play
+-r9tk69=Tiger Woods PGA Tour 09 All-Play
+-r9tp69=Tiger Woods PGA Tour 09
+-r9ze54=Major League Baseball 2K9
+-r9zp54=Major League Baseball 2K9
+-rb2e6k=Balloon Pop
+-rb2j2k=Rainbow Pop
+-rb2p6k=Pop!
+-rb2pgt=Pop!
+-rb4e08=Resident Evil 4
+-rb4j08=Biohazard 4 Wii Edition
+-rb4p08=Resident Evil 4 - Wii Edition
+-rb4x08=Resident Evil 4 - Wii Edition 
+-rb5e41=Brothers In Arms: Earned In Blood
+-rb5p41=Brothers In Arms: Earned In Blood
+-rb6j18=Bomberman
+-rb7e54=Bully: Scholarship Edition
+-rb7p54=Bully: Scholarship Edition
+-rb8e70=Backyard Baseball '09
+-rb9e78=Bratz: The Movie
+-rb9p78=Bratz The Movie
+-rbae41=Blazing Angels: Squadrons of WWII
+-rbap41=Blazing Angels: Squadrons Of WWII
+-rbbe18=Bomberman Land
+-rbbj18=Bomberman Land Wii
+-rbbp18=Bomberman Land Wii
+-rbbp99=Bomberman Land Wii
+-rbcp41=Telly Addicts
+-rbee52=Bee Movie Game
+-rbep52=Bee Movie Game
+-rbfe20=Balls of Fury
+-rbfp20=Balls Of Fury
+-rbge54=The BIGS
+-rbgp54=The Bigs
+-rbhe08=Biohazard 0
+-rbhj08=Biohazard 0
+-rbhp08=Biohazard Zero
+-rbij99=Bokujou Monogatari Waku Waku Animal March
+-rbke69=Boom Blox
+-rbkj13=Boom Blox
+-rbkk69=Boom Blox
+-rbkp69=Boom Blox
+-rble8p=Bleach: Shattered Blade
+-rblj8p=Bleach: Shattered Blade
+-rblp8p=Bleach: Shattered Blade
+-rbme5g=Bust-A-Move Bash!
+-rbmpgt=Bust-A-Move
+-rbneg9=Ben 10: Protector of Earth
+-rbnpg9=Ben 10: Protector of Earth
+-rbnxg9=Ben 10: Protector Of Earth
+-rboe69=Boogie
+-rbop69=Boogie
+-rbpe4z=Brunswick Pro Bowling
+-rbpp4z=Brunswick Pro Bowling
+-rbppgt=Brunswick Pro Bowling
+-rbqenr=Classic British Motor Racing
+-rbqpug=Classic British Motor Racing
+-rbre5g=Blast Works: Build, Trade, Destroy
+-rbrp5g=Blast Works: Build, Trade & Destroy
+-rbsj08=Sengoku Basara 2 Heroes
+-rbte8p=Sega Bass Fishing
+-rbtj8p=Sega Bass Fishing
+-rbtp8p=Sega Bass Fishing
+-rbue08=Resident Evil: The Umbrella Chronicles
+-rbuj08=Biohazard The Umbrella Chronicles
+-rbuk08=Biohazard The Umbrella Chronicles
+-rbup08=Resident Evil: The Umbrella Chronicles
+-rbve52=Barbie as The Island Princess
+-rbvp52=Barbie as The Island Princess
+-rbwe01=Battalion Wars 2
+-rbwj01=Totsugeki Famicom Wars vs.
+-rbwp01=Battalion Wars 2
+-rbxj8p=Bleach: Versus Crusade
+-rbye78=Barnyard
+-rbyj78=Barnyard
+-rbyp78=Barnyard
+-rbze5z=Billy the Wizard: Rocket Broomstick Racing
+-rbzp5z=Billy The Wizard: Rocket Broomstick Racing
+-rbzxug=Billy The Wizard: Rocket Broomstick Racing
+-rc2e78=Cars: Mater-National
+-rc2p78=Cars: Mater-National
+-rc2y78=Cars: Mater-National
+-rc3e41=Petz Catz 2
+-rc3j41=Nyanko To Mahou No Boushi
+-rc3p41=Catz
+-rc3x41=Catz
+-rc4jd9=Crayon Shin-Chan: Saikyou Kazoku Kasukabe King Wii
+-rc4sgt=Shin Chan The New Aventures For Wii
+-rc5jdq=Osouji Sentai Clean Keeper
+-rc7e20=Sea Monsters: A Prehistoric Adventure
+-rc7p7j=Sea Monsters: A Prehistoric Adventure
+-rc8e7d=Crash: Mind Over Mutant
+-rc8p7d=Crash: Mind Over Mutant
+-rc8x7d=Crash: Mind Over Mutant
+-rc9egn=Cid: The Dummy
+-rc9pgn=Cid: The Dummy
+-rcae78=Cars
+-rcaj78=Cars
+-rcap78=Cars
+-rcax78=Cars
+-rcay78=Cars
+-rcbe52=Cabela's Big Game Hunter
+-rcbp52=Cabela's Big Game Hunter
+-rcce5g=Cooking Mama: Cook Off
+-rccjc0=Cooking Mama
+-rccpgt=Cooking Mama
+-rcdd52=Call Of Duty 3
+-rcde52=Call of Duty 3
+-rcdp52=Call Of Duty 3
+-rcdx52=Call Of Duty 3
+-rcee5z=Mini Desktop Racing
+-rcep5z=Mini Desktop Racing
+-rcfe41=Cosmic Family
+-rcfp41=Cosmic Family
+-rcge54=Carnival Games
+-rcgp54=Carnival Games
+-rcheaf=We Cheer
+-rchjaf=We Cheer
+-rchpaf=We Cheer
+-rchpgt=We Cheer
+-rcie41=CSI: Hard Evidence
+-rcip41=CSI: Hard Evidence
+-rcje8p=The Conduit
+-rcjp8p=The Conduit
+-rckpgn=Alan Hansen's Sports Challenge
+-rcle4q=Disney's Chicken Little: Ace in Action
+-rclp4q=Chicken Little Ace In Action
+-rcoj99=Conan
+-rcopnp=Case Closed: One Truth Prevalis
+-rcpe18=Kororinpa: Marble Mania
+-rcpj18=Kororinpa
+-rcpp18=Kororinpa
+-rcqeda=Penny Racers Party: Turbo-Q Speedway
+-rcqjda=Choro Q
+-rcre5d=Cruis'n
+-rcrp5d=Cruis'n
+-rcse20=Chicken Shoot
+-rcsp20=Chicken Shoot
+-rcsp7j=Chicken Shoot
+-rcte5z=Counter Force
+-rctp5z=Counter Force
+-rcue52=Cabela's Legendary Adventures
+-rcup52=Cabela's Legendary Adventures
+-rcve41=Far Cry: Vengeance
+-rcvp41=Far Cry Vengeance
+-rcxe78=All Star Cheer Squad
+-rcxp78=All Star Cheer Leader
+-rcypgn=Cheggers Party Quiz
+-rd4ea4=Dance Dance Revolution: Hottest Party 2
+-rd4ja4=Dance Dance Revolution: Furu Furu Party
+-rd4pa4=Dance Dance Revolution: Hottest Party 2
+-rd6j8n=Doubutu Kisoutengai
+-rd6pnp=SAFAR'Wii
+-rd8e52=Dancing With The Stars
+-rd8p52=Dancing With The Stars
+-rd9j18=Sudoku
+-rdae52=Dancing With the Stars: We Dance!
+-rdbe70=Dragon Ball Z: Budokai Tenkaichi 2
+-rdbjaf=Dragon Ball Z: Sparking! NEO
+-rdbp70=Dragon Ball Z: Budokai Tenkaichi 2
+-rdbpaf=Dragon Ball Z Budokai Tenkaichi 2
+-rdce78=Deadly Creatures
+-rdcp78=Deadly Creatures
+-rddea4=Dance Dance Revolution: Hottest Party
+-rddja4=Dance Dance Revolution: Hottest Party
+-rddpa4=Dance Dance Revolution: Hottest Party
+-rdej0a=Zenkoku Dekotora Matsuri
+-rdfe41=Shaun White Snowboarding: Road Trip
+-rdfp41=Shaun White Snowboarding: Road Trip
+-rdgea4=Castlevania Judgment
+-rdgja4=Akumajou Dracula Judgment
+-rdgpa4=Castlevania Judgment
+-rdhe78=Destroy All Humans! Big Willy Unleashed
+-rdhp78=Destroy All Humans! Big Willy Unleashed!
+-rdie41=The Dog Island
+-rdijg2=The Dog Island
+-rdip41=The Dog Island
+-rdje4f=Death Jr.: Root of Evil
+-rdjp4f=Death Jr.: Root of Evil
+-rdke01=Donkey Kong: Barrel Blast
+-rdkj01=Donkey Kong Taru Jet Race
+-rdkp01=Donkey Kong: Jet Race
+-rdle5g=Spy Fox in Dry Cereal
+-rdlp70=Spy Fox In Dry Cereal
+-rdme6k=Domino Rally
+-rdmj8n=Go! Go! Minon
+-rdmphz=Minon: Everyday Hero
+-rdnea4=Dance Dance Revolution: Disney Grooves
+-rdoe41=Petz: Dogz 2
+-rdoj41=Dog To Mahou No Boushi
+-rdop41=Pet Dogz 2
+-rdpe54=Dora the Explorer: Dora Saves the Snow Princess
+-rdpp54=Dora the Explorer: Dora Saves the Snow Princess 
+-rdpx54=Dora the Explorer: Dora Saves the Snow Princess
+-rdqegd=Dragon Quest Swords: The Masked Queen and The Tower of Mirrors
+-rdqjgd=Dragon Quest Swords: Kamen no Joou to Kagami no Tou
+-rdqpgd=Dragon Quest Swords: The Masked Queen and the Tower of Mirrors
+-rdrea4=Dewy's Adventure
+-rdrja4=Dewy's Adventure
+-rdrpa4=Dewy's Adventure
+-rdse70=Dragon Ball Z: Budokai Tenkaichi 3
+-rdsjaf=Dragon Ball Z: Sparking! METEOR
+-rdspaf=Dragon Ball Z Budokai Tenkaichi 3
+-rdteaf=Tamagotchi: Party On!
+-rdtjaf=Tamagotchi Pikadai
+-rdtpaf=Tamagotchi: Party On!
+-rdujdq=Sugorochronicle Migite Ni Ken Wo Hidarite Ni Saikoro Wo
+-rdve41=Driver: Parallel Lines
+-rdvp41=Driver: Parallel Lines
+-rdweg9=Dragon Blade: Wrath of Fire
+-rdwjg9=Dragon Blade: Wrath Of Fire
+-rdwpg9=Dragon Blade: Wrath Of Fire
+-rdxe18=Deca Sports
+-rdxj18=Deca Sporta
+-rdxka4=Deca Sporta
+-rdxp18=Sports Island
+-rdyegn=Cid: The Dummy
+-rdze01=Disaster: Day Of Crisis
+-rdzj01=Disaster Day Of Crisis
+-rdzp01=Disaster: Day Of Crisis
+-re3enr=WWII Aces
+-re3pnr=Wii Aces
+-re4e08=Resident Evil Archives: Resident Evil
+-re4j08=Biohazard
+-re4p08=Resident Evil Archives: Resident Evil
+-re5paf=The Munchables
+-re8j99=Katekyoo Hitman Reborn Kindan No Yami No Delta
+-reae69=Celebrity Sports Showdown
+-reaf69=Celebrity Sports Showdown
+-reap69=Celebrity Sports Showdown
+-rebpmt=Mr Bean's Wacky World of Wii
+-rece6k=Spy Games: Elevator Mission
+-recp6k=Spy Games: Elevator Mission
+-rede41=Red Steel
+-redj41=Red Steel
+-redp41=Red Steel
+-refp41=My French Coach: Improve Your French
+-rege36=Emergency Mayhem
+-regp36=Emergency Mayhem
+-rehe41=Emergency Heroes
+-rehp41=Emergency Heroes
+-rejeaf=Active Life: Extreme Challenge
+-reke41=Gold's Gym: Cardio Workout
+-rekj2n=Shape Boxing Wii De Enjoy Diet
+-rekp41=My Fitness Coach: Cardio Workout
+-relea4=Elebits
+-relja4=Elebits
+-relka4=Elebits
+-relpa4=Eledees
+-remj8p=Doraemon Wii Himitsu Douguou Ketteisen
+-rene8p=Sonic and the Black Knight
+-renj8p=Sonic and the Black Knight
+-renp8p=Sonic and the Black Knight
+-reqe54=Go Diego Go: Safari Rescue
+-reqp54=Go Diego Go Safari Rescue
+-reqx54=Go, Diego !
+-rese41=My Spanish Coach: Improve Your Spanish
+-resp41=My Spanish Coach: Improve Your Spanish
+-retjaf=Ennichi No Tatsujin
+-revj8p=Imabi Kisô: Kaimei Hen
+-rewymr=My Horse Club: On the Trail of the Mysterious Appaloosa
+-rexe01=Excite Truck
+-rexj01=Excite Truck
+-rexp01=Excite Truck
+-reye4q=Disney Sing It: High School Musical 3 Senior Year
+-reyp4q=Disney Sing It: High School Musical 3
+-rezejj=Fritz Chess
+-rezpkm=Fritz Chess
+-rf2e54=Fantastic Four: Rise of the Silver Surfer
+-rf2p54=Fantastic Four: Rise Of The Silver Surfer
+-rf3e52=Ferrari Challenge: Trofeo Pirelli
+-rf3p6m=Ferrari Challenge
+-rf4p6m=Super Fruit Fall
+-rf7e08=Tatsunoko VS. Capcom: Ultimate All Stars
+-rf7j08=Tatsunoko vs. Capcom: Cross Generation of Heroes
+-rf8e69=FIFA Soccer 08
+-rf8j13=FIFA 08
+-rf8k69=FIFA 08
+-rf8p69=FIFA 08
+-rf8x69=FIFA 08
+-rf9e69=FIFA Soccer 09 All-Play
+-rf9j13=FIFA 09 All-Play
+-rf9k69=FIFA 09 All-Play
+-rf9p69=FIFA 09 All-Play
+-rf9x69=FIFA 09 All-Play
+-rf9y69=FIFA 09 All-Play
+-rfaeaf=Active Life: Outdoor Challenge
+-rfajaf=Family Trainer: Athletic World
+-rfapaf=Family Trainer
+-rfbe01=Endless Ocean
+-rfbj01=Forever Blue
+-rfbp01=Endless Ocean
+-rfee01=Fire Emblem: Radiant Dawn
+-rfej01=Fire Emblem Akatsuki No Megami
+-rfep01=Fire Emblem: Radiant Dawn
+-rffegd=Final Fantasy Crystal Chronicles: Echoes of Time
+-rffjgd=Final Fantasy Crystal Chronicles: Echoes of Time
+-rffpgd=Final Fantasy Crystal Chronicles: Echoes of Time
+-rfjjaf=Family Jockey
+-rfke41=My Fitness Coach
+-rfkj41=My Fitness Coach
+-rfkp41=My Fitness Coach: Get In Shape
+-rfkx41=My Fitness Coach: Get In Shape
+-rfle69=Madden NFL 09 All-Play
+-rflp69=Madden NFL 09 All-Play
+-rfmjaf=Pro Yakyuu Family Stadium
+-rfne01=Wii Fit
+-rfnj01=Wii Fit
+-rfnk01=Wii Fit
+-rfnp01=Wii Fit
+-rfnw01=Wii Fit
+-rfoe52=Spider-Man: Friend or Foe
+-rfop52=Spider-Man: Friend Or Foe
+-rfox52=Spider-Man: Friend Or Foe
+-rfqe69=FaceBreaker K.O. Party
+-rfqk69=FaceBreaker: K.O. Party
+-rfqp69=FaceBreaker: K.O. Party
+-rfre5g=Furu Furu Park
+-rfrj5g=Furu Furu Park
+-rfrp5g=Furu Furu Park
+-rfsj8p=Fushigi No Dungeon: Furai No Shiren 3
+-rfte70=Backyard Football
+-rftp70=Backyard Football '08
+-rfuja4=Mahjong Kakutou Club Wii: Wi-fi Taiou
+-rfve52=Monkey Mischief Party Time
+-rfvp52=Monkey Mischief! 20 games
+-rfwpnk=Safari Adventures Africa
+-rfyfmr=Fort Boyard
+-rfze41=Imagine Fashion Party
+-rfzp41=Imagine Fashion Idol
+-rg2exs=Guilty Gear XX Accent Core
+-rg2jjf=Guilty Gear XX Core
+-rg2pgt=Guilty Gear XX Accent Core
+-rg2pxs=Guilty Gear XX Accent Core 
+-rg4jc0=Let's Go By Train Shinkansen EX
+-rg5ewr=Guinness World Records: The Videogame
+-rg5pwr=Guinness World Records: The Videogame
+-rg6e69=Boogie SuperStar
+-rg6p69=Boogie Superstar
+-rg8e41=Petz Sports
+-rg8p41=Petz Sport: Dogs Playground
+-rg9e54=Carnival Games: Mini Golf
+-rg9p54=Carnival Games: Mini Golf
+-rgbe08=Harvey Birdman: Attorney at Law
+-rgbp08=Harvey Birdman: Attorney At Law
+-rgcexs=MiniCopter: Adventure Flight
+-rgcjjf=Petitcopter Wii Adventure Flight
+-rgcpxs=Minicopter: Adventure Flight
+-rgdea4=Target: Terror
+-rgdpa4=Target: Terror
+-rgejj9=The World Of Golden Eggs Norinori Rhythm
+-rgfe69=The Godfather: Blackhand Edition
+-rgff69=Le Parrain Pouvoir Et Manipulation
+-rgfi69=Il Padrino
+-rgfp69=The Godfather: Blackhand Edition
+-rgfs69=El Padrino: El Chantaje
+-rggjaf=Gegege No Kitarou Youkai Daiundoukai
+-rghe52=Guitar Hero III: Legends Of Rock
+-rghj52=Guitar Hero III Legends Of Rock
+-rghk52=Guitar Hero III Legends Of Rock 
+-rghp52=Guitar Hero III Legends Of Rock
+-rgijc8=G1 Jockey Wii
+-rgipc8=G1 Jockey
+-rgje4z=George of the Jungle and the Search for the Secret Stones
+-rgjp4z=George of the Jungle: Search for the Secret
+-rgkenr=Kidz Sports: Crazy Golf
+-rgkpnr=Crazy Mini Golf
+-rgle7d=Geometry Wars: Galaxies
+-rglp7d=Geometry Wars Galaxies
+-rgme5d=The Grim Adventures of Billy & Mandy
+-rgmp5d=The Grim Adventures Of Billy & Mandy
+-rgnjaf=Gintama Banji Oku Chuubu
+-rgpjaf=Anime Slot Revolution Pachi-Slot Kidou Senshi Gundam II Ai Senshi Hen
+-rgqe70=Ghostbusters: The Video Game
+-rgse8p=Ghost Squad
+-rgsj8p=Ghost Squad
+-rgsp8p=Ghost Squad
+-rgte41=GT Pro Series
+-rgtjbl=GT Pro Series
+-rgtp41=GT Pro Series
+-rgve52=Guitar Hero: Aerosmith
+-rgvj52=Guitar Hero: Aerosmith
+-rgvp52=Guitar Hero: Aerosmith
+-rgxe5d=Game Party
+-rgxp5d=Game Party
+-rgye5z=Action Girlz Racing
+-rgyp5z=Action Girlz Racing
+-rgze70=Godzilla: Unleashed
+-rgzp70=Godzilla Unleashed
+-rh2e41=Hell's Kitchen: The Video Game
+-rh2p41=Hell's Kitchen
+-rh3e4q=High School Musical 3: Senior Year Dance!
+-rh3j4q=High School Musical 3: Senior Year Dance
+-rh3p4q=High School Musical 3: Senior Year Dance
+-rh4xug=Hamster Heroes
+-rh5pkm=Ellen Whitaker's Horse Life
+-rh6e69=Harry Potter and the Half-Blood Prince
+-rh6p69=Harry Potter and the Half-Blood Prince
+-rh7j8p=Jissen Pachislot Hisshouhou! Sammy's Collection Hokuto no Ken Wii
+-rh8e4f=Tomb Raider: Underworld
+-rh8jel=Tomb Raider: Underworld
+-rh8p4f=Tomb Raider: Underworld
+-rh8x4f=Tomb Raider: Underworld
+-rh9jc8=Harukanaru Jikuu no Kade 4
+-rhae01=Wii Play
+-rhaj01=Hajimete No Wii
+-rhak01=Wii Play
+-rhap01=Wii Play
+-rhaw01=Wii Play
+-rhce52=The History Channel: Battle for the Pacific
+-rhcp52=History Channel: Battle for the Pacific
+-rhde8p=The House Of The Dead 2 & 3 Return
+-rhdj8p=The House of the Dead 2 & 3 Return
+-rhdp8p=The House Of The Dead 2 & 3 Return
+-rheejj=Professor Heinz Wolff's Gravity
+-rhepkm=Professor Heinz Wolff's Gravity
+-rhfe5d=Happy Feet
+-rhfp5d=Happy Feet
+-rhgp6z=Agent Hugo: Lemoon Twist
+-rhgx6z=Agent Hugo: Lemoon Twist
+-rhhj8j=Suzumiya Haruhi no Gekidou
+-rhiexj=Victorious Boxers: Revolution
+-rhij41=Hajime No Ippo Revolution
+-rhijj9=Hajime No Ippo Revolution
+-rhip41=Victorious Boxers Challenge
+-rhjj13=Ginsei Table Games Wii
+-rhke18=Help Wanted: 50 Wacky Jobs
+-rhkj18=Hataraku Hit
+-rhkp18=Job Island
+-rhle4z=World Championship Poker featuring Howard Lederer: All In
+-rhlp4z=World Championship Poker: All In
+-rhlpgt=World Championship Poker Featuring Howard Lederer: All-In
+-rhme99=Harvest Moon: Magical Melody
+-rhmee9=Harvest Moon: Magical Melody
+-rhmp99=Harvest Moon: Magical Melody
+-rhne70=My Horse and Me
+-rhnp70=My Horse & Me
+-rhoe8p=The House Of The Dead: Overkill
+-rhop8p=House of the Dead: Overkill
+-rhpj8n=Akko De Pon! Ikasama Hourouki
+-rhqe4q=Hannah Montana: Spotlight World Tour
+-rhqp4q=Hannah Montana: Spotlight World Tour
+-rhrj99=Kateikyoushi Hitman Reborn! Dream Hyper Battle
+-rhse36=Heatseeker
+-rhsp36=Heatseeker
+-rhsx36=Heatseeker
+-rhte54=Manhunt 2
+-rhtp54=Manhunt 2
+-rhue20=Skate City Heroes
+-rhup20=Skate City Heroes
+-rhup7j=Skate City Heroes
+-rhuxug=Hamster Heroes
+-rhwe52=Hot Wheels: Beat That!
+-rhwp52=Hot Wheels: Beat That!
+-rhxe78=Battle of the Bands
+-rhxp78=Battle Of The Bands
+-rhyjaf=Haneru no Tobira Wii
+-rhze41=Petz Horsez 2
+-rhzp41=Pippa Funnell: Ranch Rescue
+-ri2e4q=High School Musical: Sing It!
+-ri2p4q=High School Musical: Sing It!
+-ri3e5d=The Ant Bully
+-ri3p5d=The Ant Bully
+-ri6enr=Summer Sports 2: Island Sports Party
+-ri6p41=Summer Sports Party
+-ri6pnr=Sports Island 2
+-ri8e41=Brothers In Arms: Road to Hill 30
+-ri8p41=Brothers In Arms: Road To Hill 30
+-ri9egt=Diva Girls: Divas on Ice
+-ri9pgt=Diva Girls: Princess On Ice
+-riae52=Ice Age: Dawn of the Dinosaurs
+-riap52=Ice Age 3 - Dawn of the Dinosaurs
+-ribes5=Igor the Game
+-ribpkm=Igor: The Game
+-ribps5=Igor: The Game
+-ricenr=Iron Chef America: Supreme Cuisine
+-ridp7j=Smiley World: Island Challenge
+-rieea4=Karaoke Revolution Presents: American Idol Encore
+-riepa4=Karaoke Revolution&nbsp;:&nbsp;American Idol Encore
+-rifea4=Karaoke Revolution Presents: American Idol Encore 2
+-rige54=Go Diego Go! Great Dinosaur Rescue
+-rigp54=Go Diego Go Great Dinosaur Rescue
+-rihe8p=The Incredible Hulk
+-rihp8p=The Incredible Hulk
+-riipng=Kart Racer
+-rije69=G.I. JOE: The Rise of Cobra
+-rijp69=G.I. JOE: The Rise of Cobra
+-rikpng=Truck Racer
+-rilj18=Illust Logic + Colorful Logic
+-rime36=Impossible Mission
+-rimp6m=Impossible Mission
+-rine08=Dead Rising: Chop Till You Drop
+-rinj08=Dead Rising Zombie No Ikenie
+-rinp08=Dead Rising: Chop Till You Drop
+-riopsu=Horrible Histories: Ruthless Romans
+-ripeaf=One Piece: Unlimited Adventure
+-ripjaf=One Piece Unlimited Adventure
+-rippaf=One Piece Unlimited Cruise 1 - The Treasure Beneath the Waves 
+-rire8p=Iron Man
+-rirp8p=Iron Man
+-ritfmr=Intervilles, le jeu officiel
+-riujaf=One Piece Unlimited Cruise Episode 2 Mezameru Yuusha
+-riwenr=Burger Island
+-riye52=Space Camp
+-riyp52=Space Camp
+-rizenr=Indianapolis 500 Legends
+-rj2e52=007: Quantum of Solace
+-rj2p52=007: Quantum of Solace
+-rj3e20=Jeep Thrills
+-rj3p7j=Jeep Thrills
+-rj4enr=Jewel Master: Cradle of Rome
+-rj4prm=Jewel Master: Cradle of Rome
+-rj8e64=Indiana Jones and the Staff of Kings
+-rj8p64=Indiana Jones and the Staff of Kings
+-rj9pfr=Think Logic Trainer
+-rjbjaf=Daikaijuu Battle Ultra Coliseum
+-rjce52=Score International Baja 1000
+-rjcp52=Score International Baja 1000&nbsp;:&nbsp;World Championschip Offroad Racing
+-rjdpkm=My Animal Centre
+-rjee70=Jenga
+-rjep70=Jenga World Tour
+-rjfe5g=Jillian Michaels' Fitness Ultimatum 2009
+-rjfp5g=Jillian Michael's Fitness Ultimatum 2009
+-rjfpkm=Jillian Michaels Fitness Ultimatum
+-rjgjda=Jinsei Game Wii
+-rjmers=Jumper: Griffin's Story
+-rjmprs=Jumper: Griffin's Story
+-rjne20=Build 'N Race
+-rjojj9=Kyoufu Taikan Juon
+-rjpja4=Jikkyou Powerful Pro Yakyuu Wii
+-rjqe5g=Pajama Sam: Don't Fear the Dark
+-rjqp70=Pajama Sam: No Need to Hide when it's Dark Outside
+-rjsenr=Kawasaki Jet Ski
+-rjspnr=Kawasaki Jet Ski
+-rjsxug=Kawasaki Jet Ski
+-rjtj01=Minnano Joshikiryoku Terebi
+-rjvegn=Hysteria Hospital: Emergency Ward
+-rjvpgn=Hysteria Hospital: Emergency Ward 
+-rjwjel=Jawa mammoth And A Secret Stone
+-rjxe5g=Go Play Lumberjacks
+-rjzp7u=SNK Arcade Classics Volume 1
+-rk2eeb=Trauma Center: New Blood
+-rk2jeb=Trauma Center: New Blood
+-rk2p01=Trauma Center: New Blood
+-rk4jaf=Kekkaishi
+-rk6e18=Marble Saga: Kororinpa
+-rk6j18=Kororinpa 2
+-rk6p18=Marbles! Balance Challenge
+-rk7j0a=Ougon no Kizuna
+-rk8e54=Major League Baseball 2K8
+-rk8p54=Major League Baseball 2K8
+-rkae6k=Ultimate Shooting Collection
+-rkajms=Milestone Shooting Collection
+-rkak8m=Milestone Shooting Collection Karous Wii
+-rkap6k=Ultimate Shooting Collection
+-rkbe41=Cranium Kabookii
+-rkbp41=Cranium Kabookii
+-rkdeeb=Trauma Center: Second Opinion
+-rkdjeb=Trauma Center: Second Opinion
+-rkdp01=Trauma Center: Second Opinion
+-rkdpeb=Trauma Center: Second Opinion
+-rkeenr=Cate West: The Vanishing Files
+-rkepnr=Cate West: The Vanishing Files
+-rkfe7u=The King Of Fighters Collection: The Orochi Saga
+-rkfeh4=King of Fighters Collection: The Orochi Saga
+-rkfp7u=King Of Fighters Collection: The Orochi Saga
+-rkgegy=Bratz Kidz: Slumber Party
+-rkgpgy=Bratz Kidz Party
+-rkhe52=Kung Fu Panda - Legendary Warriors
+-rkhp52=Kung Fu Panda: Legendary Warriors
+-rkienr=Kidz Sports: Ice Hockey
+-rkipnr=Ice Hockey
+-rkjj0q=250 Mannin no Kanken Wii de Tokoton Kanji Nou
+-rkke6k=Heavenly Guardian
+-rkkp6k=Heavenly Guardian
+-rkleg9=Coraline
+-rklpg9=Coraline
+-rkme5d=Mortal Kombat: Armageddon
+-rkmp5d=Mortal Kombat: Armageddon
+-rknj2n=Kanken Wii: Kanji Ou Kettei Sen 
+-rkojbl=Relaxuma Minna De Goyururi Seikatsu
+-rkpe52=Kung Fu Panda
+-rkpj52=Kung Fu Panda
+-rkpk52=Kung Fu Panda 
+-rkpp52=Kung Fu Panda
+-rkpy52=Kung Fu Panda
+-rkqenr=Candace Kane's Candy Factory
+-rksenr=Kidz Sports Basketball
+-rkspug=Kidz Sports Basketball
+-rktenr=Kidz Sports: International Soccer
+-rktxug=Kidz Sports International Football
+-rkve54=The BIGS 2
+-rkvp54=The Bigs 2: Baseball
+-rkwj18=Jigsaw Puzzle Kyo-no Wan Ko
+-rkxe69=Rock Band
+-rkxp69=Rock Band
+-rkye20=Army Men: Soldiers of Misfortune
+-rkyp20=Army Men: Soldiers Of Misfortune
+-rkyp7j=Army Men Soldiers of misfortune
+-rkzea4=Lost in Blue: Shipwrecked
+-rkzja4=Survival Kids Wii
+-rkzpa4=Lost In Blue: Shipwrecked
+-rl2e78=Gallop & Ride!
+-rl2hmr=Horse & Pony: My Riding Stables
+-rl2pfr=Horse & Pony: My Riding Stables
+-rl3emj=Luxor 3
+-rl3pmj=Luxor 3
+-rl8e54=MLB Power Pros 2008
+-rl9phz=King of Pool
+-rladmr=Deal or No Deal: The Banker Is Back
+-rlae20=Deal or No Deal
+-rlap20=Deal Or No Deal
+-rlapmr=Deal or No Deal: The Banker Is Back
+-rlbewr=LEGO Batman: The Videogame
+-rlbpwr=LEGO Batman: The Videogame
+-rldegy=Legend of the Dragon
+-rldpfk=Legend Of The Dragon
+-rleefs=Ten Pin Alley 2
+-rlepfs=Ten Pin Alley: 2
+-rlfe64=Star Wars The Clone Wars: Lightsaber Duels
+-rlfp64=Star Wars: The Clone Wars Lightsaber Duels
+-rlge64=LEGO Star Wars: The Complete Saga
+-rlgj52=LEGO Star Wars: The Complete Saga
+-rlgp64=LEGO Star Wars: The Complete Saga
+-rlhe52=Little League World Series Baseball 2008
+-rlhp52=Little League: World Series Baseball 2008
+-rlie64=LEGO Indiana Jones: The Original Adventures
+-rlip64=LEGO Indiana Jones: The Original Adventures
+-rljehj=Line Rider 2: Unbound
+-rljpkm=Line Rider Freestyle
+-rlkegy=Code Lyoko: Quest For Infinity
+-rlkpfk=Code Lyoko: Quest For Infinity
+-rllp70=Go West: a Lucky Luke Adventure
+-rlmjh4=Metal Slug Complete
+-rlnfmr=Koh-lanta
+-rlnhmr=Expeditie Robinson 
+-rlnimr=L'isola Dei Famosi
+-rlpe69=Littlest Pet Shop
+-rlpp69=Littlest Pet Shop
+-rlqe52=Big League Sports
+-rlqp52=World Championship Sports
+-rlre4f=Tomb Raider: Anniversary
+-rlrjel=Tomb Raider: Anniversary
+-rlrp4f=Tomb Raider: Anniversary
+-rlse8p=Alien Syndrome
+-rlsp8p=Alien Syndrome
+-rltenr=London Taxi: Rush Hour
+-rltpnr=London Taxi: Rush Hour
+-rltxug=London Taxi: Rush Hour
+-rlue4q=Disney's Bolt
+-rlup4q=Bolt
+-rlux4q=Bolt
+-rluy4q=Bolt
+-rlve78=Avatar: The Last Airbender
+-rlvp78=Avatar: The Legend Of Aang 
+-rlwe78=Ratatouille
+-rlwj78=Ratatouille
+-rlwp78=Ratatouille
+-rlwx78=Ratatouille
+-rlxemj=Luxor: Pharaoh's Challenge
+-rlxp36=Luxor Pharaos Challenge
+-rlyewr=Looney Tunes: Acme Arsenal
+-rlypwr=Looney Tunes: Acme Arsenal
+-rlze4z=Defendin' De Penguin
+-rlzp4z=Defendin' De Penguin
+-rm2e69=Medal of Honor: Heroes 2
+-rm2j13=Medal Of Honor: Heroes2
+-rm2p69=Medal of Honor: Heroes 2
+-rm2u69=Medal Of Honor: Heroes 2
+-rm2x69=Medal of Honor: Heroes 2
+-rm3e01=Metroid Prime 3: Corruption
+-rm3j01=Metroid Prime 3: Corruption
+-rm3p01=Metroid Prime 3: Corruption
+-rm4e41=Monster 4x4: World Circuit
+-rm4j41=Monster 4X4
+-rm4p41=Monster 4x4: World Circuit
+-rm5e7d=The Mummy: Tomb of the Dragon Emperor
+-rm5p7d=The Mummy: Tomb Of The Dragon Emperor
+-rm6e99=Baroque
+-rm6j99=Baroque
+-rm6p99=Baroque
+-rm7e4f=Monster Lab
+-rm7p4f=Monster Lab
+-rm8e01=Mario Party 8
+-rm8j01=Mario Party 8
+-rm8k01=Mario Party 8
+-rm8p01=Mario Party 8
+-rm9egm=Mushroom Men: The Spore Wars
+-rm9pgm=Mushroom Men: The Spore Wars
+-rmae01=Mario Power Tennis
+-rmaj01=Mario Power Tennis
+-rmap01=New Play Control! Mario Power Tennis
+-rmbe01=Mario Super Sluggers
+-rmbj01=Super Mario Stadium: Family Baseball
+-rmbp01=Mario Super Sluggers
+-rmce01=Mario Kart Wii
+-rmcj01=Mario Kart Wii
+-rmck01=Mario Kart Wii
+-rmcp01=Mario Kart Wii
+-rmde69=Madden NFL 07
+-rmdp69=Madden NFL 07
+-rmejda=Major Dream
+-rmfe68=AMF Bowling Pinbusters!
+-rmfp68=AMF Bowling Pinbusters
+-rmge01=Super Mario Galaxy
+-rmgj01=Super Mario Galaxy
+-rmgk01=Super Mario Galaxy
+-rmgp01=Super Mario Galaxy
+-rmhj08=Monster Hunter 3
+-rmie20=Margot's Word Brain
+-rmip7j=Margot's Word Brain
+-rmjjc8=Mah-jong Rally Wii
+-rmleh4=Metal Slug Anthology
+-rmljh4=Metal Slug Complete
+-rmlk52=Metal Slug Complete
+-rmlp7u=Metal Slug Anthology
+-rmlph4=Metal Slug Anthology
+-rmme7u=Mercury Meltdown Revolution
+-rmmp7u=Mercury Meltdown Revolution
+-rmndfr=My Pet Hotel
+-rmnhmn=My Pet Hotel
+-rmnhmr=My Pet Hotel
+-rmnpfr=My Pet Hotel
+-rmoe52=Monster Jam
+-rmop52=Monster Jam
+-rmpe54=MLB Power Pros
+-rmpp54=MLB Power Pros
+-rmqenr=Myth Makers: Orbs of Doom
+-rmqpug=Myth Makers: Orbs Of Doom
+-rmre5z=Cocoto Magic Circus
+-rmrp5z=Cocoto Magic Circus
+-rmrpnk=Cocoto Magic Circus
+-rmtj18=Momotarô Dentetsu 16
+-rmue52=Marvel: Ultimate Alliance
+-rmuj2k=Marvel: Ultimate Alliance
+-rmup52=Marvel: Ultimate Alliance
+-rmve69=Medal of Honor: Vanguard
+-rmvp69=Medal Of Honor: Vanguard
+-rmvx69=Medal of Honor: Vanguard
+-rmwe20=M&M's Kart Racing
+-rmwp20=M&M's Kart Racing
+-rmxe78=MX vs. ATV: Untamed
+-rmxp78=MX vs. ATV: Untamed
+-rmye5z=Myth Makers: Super Kart GP
+-rmypug=Myth Makers Super Kart GP
+-rmze5z=Myth Makers: Trixie in Toyland
+-rmzpug=Myth Makers: Trixie In Toyland
+-rmzx69=Medal of Honor: Heroes 2
+-rn2eaf=Namco Museum Remix
+-rn2p70=Namco Museum Remix
+-rn3e78=Nicktoons: Attack of the Toybots
+-rn3j78=Spongebob's Atlantis Squarepantis
+-rn3p78=Nicktoons Attack of the toybots
+-rn3x78=Nicktoons: Attack Of The Toybots
+-rn4e41=Dawn of Discovery
+-rn4p41=Anno: Create a New World
+-rn5e78=The Naked Brothers Band: The Videogame
+-rn5p78=The Naked Brothers Band
+-rn6enr=North American Hunting Extravaganza
+-rn6pnr=North American Hunting
+-rn7e78=Neighborhood Games
+-rn7p78=Big Family Games
+-rn8jc8=Nobunaga No Yabou Kakushin With Power Up Kit
+-rn9e4f=Escape from Bug Island
+-rn9jel=Necro-Nesia
+-rn9p4f=Escape From Bug Island
+-rnae69=NCAA Football 09
+-rnbe69=NBA Live 08
+-rnbp69=NBA Live 08
+-rnbx69=NBA Live 08
+-rnceh4=SNK Arcade Classics Volume 1
+-rncph4=SNK Arcade Classics Volume 1
+-rndjaf=Nodame Cantabile Dream Orchestra
+-rnejda=Naruto Shippuuden Gekitou Ninja Taisen EX 3
+-rnfe69=Madden NFL 08
+-rnfp69=Madden NFL 08
+-rngj99=Negima!? Neo Pactio Fight!!
+-rnhe41=No More Heroes
+-rnhj99=No More Heroes
+-rnhk8m=No More Heroes
+-rnhp99=No More Heroes
+-rnipgt=Mind, Body & Soul: Nutrition Matters
+-rnke69=Nerf N-Strike
+-rnkp69=Nerf N-Strike
+-rnle54=NHL 2K9
+-rnlp54=NHL 2K9
+-rnme5z=Ninjabread Man
+-rnmp5z=Ninjabread Man
+-rnmxug=Ninjabread Man
+-rnne4q=The Chronicles of Narnia: Prince Caspian
+-rnnp4q=The Chronicles of Narnia: Prince Caspian
+-rnnx4q=The Chronicles of Narnia: Prince Caspian
+-rnny4q=The Chronicles of Narnia: Prince Caspian
+-rnnz4q=The Chronicles of Narnia: Prince Caspian
+-rnoj01=Another Code R Kioku no Tobira
+-rnop01=Another Code: R - A Journey Into Lost Memories
+-rnpe69=Need for Speed: ProStreet
+-rnpj13=Need for Speed: ProStreet
+-rnpk69=Need for Speed: ProStreet
+-rnpp69=Need for Speed: ProStreet
+-rnpx69=Need for Speed: ProStreet
+-rnre41=Nitro Bike
+-rnrj41=Nitro Bike
+-rnrp41=Nitro Bike
+-rnsd69=Need for Speed: Carbon
+-rnse69=Need for Speed: Carbon
+-rnsf69=Need for Speed Carbon
+-rnsj13=Need for Speed: Carbon
+-rnsp69=Need for Speed: Carbon
+-rnsx69=Need for Speed: Carbon
+-rnue8p=Nancy Drew: The White Wolf of Icicle Creek
+-rnve5z=Anubis II
+-rnvp5z=Anubis II
+-rnvxug=Anubis II
+-rnwjaf=Namco Carnival
+-rnwkaf=Namco Museum Remix
+-rnxeda=Naruto: Clash of Ninja Revolution
+-rnxjda=Naruto Shippuuden Gekitou Ninja Taisen EX
+-rnxpda=Naruto: Clash Of Ninja Revolution
+-rnyeda=Naruto: Clash of Ninja Revolution 2
+-rnyjda=Naruto Shippuuden Gekitou Ninja Taisen EX 2
+-rnypda=Naruto: Clash Of Ninja Revolution 2
+-rnze69=Ninja Reflex
+-rnzj13=Ninja Reflex
+-rnzk69=Ninja Reflex
+-rnzp69=Ninja Reflex
+-ro2e7n=Ford Racing Off Road
+-ro2p7n=Off Road
+-ro3e00=Little King's Story
+-ro3exj=Little King's Story
+-ro3p99=Little King's Story
+-ro7e7d=The Legend of Spyro: The Eternal Night
+-ro7p7d=The Legend Of Spyro: The Eternal Night
+-ro8e7d=The Legend of Spyro: Dawn of the Dragon
+-ro8p7d=The Legend of Spyro: Dawn of the Dragon
+-ro8x7d=The Legend of Spyro: Dawn of the Dragon
+-ro9pnk=Aqua Panic
+-roae36=Overlord: Dark Legend
+-roap36=Overlord: Dark Legend
+-robe7u=Obscure: The Aftermath
+-robppl=Obscure 2
+-roce5z=Cocoto Kart Racer
+-rocpnk=Cocoto Kart Racer
+-rode01=WarioWare: Smooth Moves
+-rodj01=Wario Ware: Smooth Moves
+-rodk01=Wario Ware: Smooth Moves
+-rodp01=Wario Ware: Smooth Moves
+-roeejz=Hotel for Dogs
+-roepgt=Hotel For Dogs
+-rofe5z=Offroad Extreme Special Edition
+-rofpug=Offroad Extreme!
+-roge78=Tak and the Guardians of Gross
+-rogp78=Tak And The Guardians Of Gross
+-rohjaf=Happy Dance Collection
+-rokj18=Karaoke Joysound Wii
+-romj08=Monster Hunter G
+-roneg9=Onechanbara: Bikini Zombie Slayers
+-ronjg9=Onechanbara Revolution
+-ronpg9=Onechanbara: Bikini Zombie Slayers
+-rope41=Open Season
+-ropp41=Open Season
+-roqjep=Baroque For Wii
+-rosj01=Takt Of Magic
+-rote20=Twin Strike: Operation Thunder
+-rotp20=Twin Strike
+-rotp7j=Twin Strike: Operation Thunder
+-roujaf=One Piece Unlimited Cruise Episode 1
+-roupaf=One Piece - Unlimited Cruise 1: The Treasure Beneath the Waves
+-rowe08=Okami
+-rowp08=Okami
+-roxe20=Order Up!
+-roxp7j=Order Up!
+-roxx7j=Order Up!
+-rp2e69=Smarty Pants
+-rp2p69=Smarty Pants
+-rp3jaf=Pro Golfer Saru
+-rp4e69=MySims Party
+-rp4j13=Boku To Sim No Machi Party
+-rp4p69=MySims Party
+-rp5ja4=Jikkyou Pawafuru Puroyakyu 15
+-rp6e41=Petz Crazy Monkeyz
+-rp6p41=Petz Monkey Madness
+-rp7e52=Pirate's Quest: Hunt for Blackbeard's Booty
+-rp7p52=Pirates: Hunt For Blackbeard's Booty
+-rp9ers=Space Chimps
+-rp9prs=Space Chimps
+-rp9xrs=Space Chimps
+-rpaf70=Kid Paddle Lost In The Game
+-rpbe01=Pokémon Battle Revolution
+-rpbj01=Pokémon Battle Revolution
+-rpbp01=Pokémon Battle Revolution
+-rpce20=Puzzler Collection
+-rpcp41=Puzzler Collection
+-rpcx7j=Puzzler Collection
+-rpdegn=PDC Championship Darts 2008
+-rpdpgn=PDC Championship Darts 2008
+-rpfe52=Pitfall: The Big Adventure
+-rpfp52=Pitfall: The Big Adventure
+-rpge5d=Rampage: Total Destruction
+-rpgp5d=Rampage: Total Destruction
+-rpie52=Pimp My Ride
+-rpip52=Pimp My Ride
+-rpjj99=Arc Rise Fantasia
+-rpke52=World Series of Poker: Tournament of Champions
+-rpkp52=World Series of Poker: Tournament of Champions 2007 Edition
+-rple52=Rapala Tournament Fishing
+-rplp52=Rapala Tournament Fishing
+-rpmja4=Jikkgou Powerful Pro Major League 2
+-rpne78=Paws & Claws: Pet Resort
+-rpoec8=Opoona
+-rpojc8=Opoona
+-rpopc8=Opoona
+-rppe41=Prince of Persia: Rival Swords
+-rppp41=Prince Of Persia: Rival Swords
+-rpqes5=Pool Party
+-rpqps5=Pool Party
+-rpse4q=Disney Princess: Enchanted Journey
+-rpsj4q=Disney Princess Wii
+-rpsp4q=Disney Princess: Enchanted Journey
+-rpte52=Puppy Luv: Your New Best Friend
+-rptp52=Puppy Luv
+-rpuj8p=Puyo Puyo 15th Anniversary
+-rpve4z=Purr Pals
+-rpvpkm=Purr Pals
+-rpxe69=EA Playground
+-rpxj13=EA Playground
+-rpxp69=EA Playground
+-rpye9b=Super Swing Golf
+-rpyj9b=Super Swing Golf
+-rpyp9b=Pangya! Golf With Style
+-rpzja4=Jikkyou Powerful Pro Yakyuu Wii Ketteiban
+-rq2jk6=Crazy Climber Wii
+-rq3pgn=PDC Championship Darts 2009
+-rq4e78=SpongeBob SquarePants: Creature from the Krusty Krab
+-rq4j78=Spongebob Squarepants: Creature From The Krusty Krab
+-rq4p78=Spongebob Squarepants: Creature From The Krusty Krab 
+-rq5e5g=Mad Dog McCree Gunslinger Pack
+-rq5p5g=Mad Dog McCree&nbsp;:&nbsp;Gunslinger Pack
+-rq5x5g=Mad Dog McCree Gunslinger Pack
+-rq6ejj=Cursed Mountain
+-rq6xkm=Cursed Mountain
+-rq8e08=Moto GP 08
+-rq8p08=MotoGP 08
+-rq9e69=NBA Live 09 All-Play
+-rq9p69=NBA Live 09 All-Play
+-rqbenr=Kawasaki Quad Bikes
+-rqbpnr=Kawasaki Quad Bikes
+-rqbpug=Kawasaki Quad Bikes
+-rqbxug=Kawasaki Quad Bikes
+-rqceaf=The Munchables
+-rqee6u=Agatha Christie: Evil Under the Sun
+-rqep6v=Agatha Christie: Evil Under The Sun
+-rqfe6u=Safecracker: The Ultimate Puzzle Adventure
+-rqfp6v=Safecracker
+-rqge69=MySims Racing
+-rqgj13=MySims Racing
+-rqgj69=Boku To Sim No Machi Racing
+-rqgp69=Mysims Racing
+-rqje7d=Crash of the Titans
+-rqjp7d=Crash Of The Titans
+-rqjx7d=Crash Of The Titans
+-rqke41=Circus Games
+-rqkp41=Fun Fair Party
+-rqmevn=Ocean Commander
+-rqmpvn=Ocean Commander
+-rqpe52=Cabela's Trophy Bucks
+-rqpp52=Cabela's Trophy Bucks
+-rqqe70=Backyard Football '09
+-rqrjaf=The Sky Crawlers: Innocent Aces
+-rqsp6m=Gottlieb Pinball Classics
+-rqte6u=Agatha Christie: And Then There Were None
+-rqtp6u=Agatha Christie: And Then There Were None
+-rqtp6v=And Then There Where None
+-rqweg9=Puzzle Quest: Challenge of the Warlords
+-rqwpg9=Puzzle Quest: Challenge of the Warlords
+-rqxp70=Asterix At The Olympic Games
+-rqyenr=Fantasy Aquarium World
+-rr2enr=Rig Racer 2
+-rr2pnr=Rig Racer 2
+-rr4egy=Build-A-Bear Workshop: A Friend Fur All Seasons
+-rr4pfk=Build-A-Bear Workshop
+-rr5e70=Ready 2 Rumble Revolution
+-rr5p70=Ready 2 Rumble Revolution
+-rr7pvp=Real Madrid The Game
+-rr9e78=WWE SmackDown! vs. RAW 2009
+-rr9p78=WWE SmackDown! vs. RAW 2009
+-rrae5z=Rock 'N' Roll Adventures
+-rrap5z=Rock'n'Roll Adventures
+-rraxug=Rock'n'Roll Adventures
+-rrbe41=Rayman Raving Rabbids
+-rrbj41=Rayman Raving Rabbids
+-rrbp41=Rayman Raving Rabbids
+-rrce52=Barbie Horse Adventures: Riding Camp
+-rrcp52=Barbie Horse Adventures: Riding Camp
+-rrde69=Rock Band Track Pack Volume 2
+-rrdp69=Rock Band Song Pack 2
+-rree69=Rock Band Track Pack Volume 1
+-rrep69=Rock Band Song Pack 1
+-rrge52=Madagascar: Escape 2 Africa
+-rrgp52=Madagascar 2 Escape 2 Africa
+-rrjpmr=Ready Steady Cook : The Game
+-rrke70=Alone in the Dark
+-rrkp70=Alone In The Dark
+-rrle78=Bratz: Girlz Really Rock
+-rrlp78=Bratz: Girlz Really Rock
+-rrlx78=Bratz: Girlz Really Rock
+-rrme69=Hasbro: Family Game Night
+-rrmp69=Hasbro: Family Game Night
+-rrmx69=Hasbro: Family Game Night
+-rrpe41=The Price is Right
+-rrqe52=Shrek's Carnival Craze Party Games
+-rrqp52=Shrek's Carnival Craze Party Games
+-rrre5z=Real Heroes: Firefighter
+-rrse4q=Meet the Robinsons
+-rrsj4q=Meet The Robinsons
+-rrsp4q=Meet The Robinsons
+-rrte52=Block Party
+-rrtp52=Block Party: 20 Games
+-rruejf=Winter Sports 2: The Next Challenge
+-rrufrt=Winter Sports 2009: The Next Challenge 
+-rrujjf=Winter Sports 2009 The Next Challenge
+-rruprt=RTL Winter Sports 2009: The Next Challenge
+-rrvenr=Battle Rage: Mech Conflict
+-rrvpnr=Battle Rage: Mech Conflict
+-rrxe5z=Monster Trux Arenas: Special Edition
+-rrxp5z=Monster Trux Arenas
+-rrxxug=Monster Trux Arenas
+-rryphy=Rogue Trooper: Quartz Zone Massacre
+-rrzegy=Rubik's World
+-rrzpgy=Rubik's Puzzle World
+-rs2egj=Ultimate Duck Hunting
+-rs2pgj=Ultimate Duck Hunting
+-rs3e52=Spider-Man 3
+-rs3j52=Spider-Man 3
+-rs3p52=Spider-Man 3
+-rs3x52=Spiderman 3
+-rs4exs=Castle of Shikigami III
+-rs4jjf=Shikigami No Shiro III
+-rs4pxs=Castle Of Shikigami III
+-rs5ec8=Samurai Warriors: Katana
+-rs5jc8=Sengokumusou Katana
+-rs5pc8=Samurai Warriors: Katana
+-rs7j01=Eyeshield 21
+-rs8j8n=Shanghai
+-rs9e8p=Sonic Riders: Zero Gravity
+-rs9j8p=Sonic Riders: Shooting Star Story
+-rs9p8p=Sonic Riders: Zero Gravity
+-rsae78=SpongeBob's Atlantis SquarePantis
+-rsap78=Spongebob's Atlantis Squarepantis
+-rsbe01=Super Smash Bros. Brawl
+-rsbj01=Dairantou Smash Brothers X
+-rsbp01=Super Smash Bros. Brawl
+-rscd7d=Scarface
+-rsce7d=Scarface: The World Is Yours
+-rscp7d=Scarface
+-rsdjaf=SD Gundam Scad Hammers
+-rsejgd=Soul Eater Monotone Princess
+-rsfe7u=Muramasa: The Demon Blade
+-rsfj99=Oboro Muramasa
+-rshe69=MySims Kingdom
+-rshj13=Boku to Sim no Machi Kingdom
+-rshk69=MySims Kingdom 
+-rshp69=MySims Kingdom
+-rsie69=MySims
+-rsip69=MySims
+-rsje41=Broken Sword: The Shadow Of The Templars
+-rsjp41=Broken Sword: The Shadow Of The Templars
+-rske52=Shrek The Third
+-rskp52=Shrek The Third
+-rskx52=Shrek The Third
+-rsleaf=Soulcalibur: Legends
+-rsljaf=Soulcalibur: Legends
+-rslkaf=Soulcalibur: Legends
+-rslpaf=Soulcalibur: Legends
+-rsme8p=Super Monkey Ball: Banana Blitz
+-rsmj8p=Super Monkey Ball
+-rsmp8p=Super Monkey Ball: Banana Blitz
+-rsnd69=The Simpsons Game
+-rsne69=The Simpsons Game
+-rsnf69=The Simpsons Game
+-rsnp69=The Simpsons Game
+-rsoe4z=Solitaire & Mahjong
+-rsop4z=Solitare Mahjong
+-rspe01=Wii Sports
+-rspj01=Wii Sports
+-rspk01=Wii Sports
+-rspp01=Wii Sports
+-rspw01=Wii Sports
+-rsqeaf=We Ski
+-rsqjaf=Family Ski
+-rsqpaf=Family Ski
+-rsre8p=Sonic and the Secret Rings
+-rsrj8p=Sonic and the Secret Rings
+-rsrp8p=Sonic and the Secret Rings
+-rsseh4=Samurai Shodown Anthology
+-rssjh4=Samurai Spirits: Rokuban Shoubu
+-rssk52=Samurai Shodown Anthology 
+-rssp7u=Samurai Shodown Anthology
+-rste64=Star Wars: The Force Unleashed
+-rstj52=Star Wars: The Force Unleashed
+-rstp64=Star Wars: The Force Unleashed
+-rsuenr=Summer Sports: Paradise Island
+-rsup41=Sports Party
+-rsve8p=Sonic Unleashed
+-rsvj8p=Sonic World Adventure
+-rsvp8p=Sonic Unleashed
+-rsxe69=SSX Blur
+-rsxj13=SSX Blur
+-rsxk69=SSX Blur
+-rsxp69=SSX Blur
+-rsye20=Showtime Championship Boxing
+-rsyp20=Showtime Championship Boxing
+-rszjes=Yukinko Daisenpuu
+-rszpgt=Legend Of Sayuki
+-rt2e20=Arctic Tale
+-rt2p20=Arctic Tale
+-rt2p7j=Arctic Tale
+-rt3e54=Rockstar Games presents Table Tennis
+-rt3jel=Rockstar Games Presents Table Tennis
+-rt3p54=Rockstar Games Presents Table Tennis
+-rt4eaf=Tales of Symphonia: Dawn of the New World
+-rt4jaf=Tales Of Symphonia: Ratatosk no Kishi
+-rt4paf=Tales Of Symphonia: Dawn of the New World
+-rt5e8p=Sega Superstars Tennis
+-rt5p8p=SEGA Superstars Tennis
+-rt6fkm=Le Manège Enchanté
+-rt6pkm=Magic Roundabout
+-rt7e69=Tiger Woods PGA Tour 07
+-rt7p69=Tiger Woods PGA Tour 07
+-rt8e69=Tiger Woods PGA Tour 08
+-rt8j69=Tiger Woods PGA Tour Golf 08
+-rt8k69=Tiger Woods PGA Tour Golf 08
+-rt8p69=Tiger Woods PGA Tour 08
+-rt9e52=Tony Hawk's Proving Ground
+-rt9p52=Tony Hawk's Proving Ground
+-rtbe52=Rapala's Fishing Frenzy
+-rtbp52=Rapala's Fishing Frenzy
+-rtce41=Tom Clancy's Splinter Cell: Double Agent
+-rtcp41=Splinter Cell: Double Agent
+-rtde6k=The Monkey King: The Legend Begins
+-rtdjes=Shin Chuuka Taisen
+-rtdk8m=Shin Chuuka Taisen
+-rtdp6k=The Monkey King
+-rtee78=Paws & Claws: Pet Vet
+-rtehmr=My Vet Practice
+-rtepfr=My Vet Practice
+-rtfe52=Transformers: The Game
+-rtfj52=Transformers: The Game
+-rtfk52=Transformers: The Game 
+-rtfp52=Transformers: The Game
+-rtfx52=Transformers:The Game
+-rtfy52=Transformers: The Game
+-rthe52=Tony Hawk's Downhill Jam
+-rthp52=Tony Hawk's Downhill Jam
+-rtje68=Star Trek: Conquest
+-rtjp68=Star Trek: Conquest
+-rtke5z=Octomania
+-rtkjdq=Sharuui Takoron
+-rtkk8m=Sharuui Takoron
+-rtle18=Fishing Master: World Tour
+-rtlj18=Mezase Tsuri Master Sekai Ni Challenge Hen
+-rtlp18=Fishing Master: World Tour
+-rtme41=TMNT
+-rtmp41=TMNT: Teenage Mutant Ninja Turtles
+-rtne01=Tenchu: Shadow Assassins
+-rtnjcq=Tenchu 4
+-rtnp41=Tenchu: Shadow Assassins
+-rtoj8p=428: Fuusa Sareta Shibuya de
+-rtqenr=Monster Trux: Offroad
+-rtqpug=Monster Trux: Offroad
+-rtre18=Fishing Master
+-rtrj18=Mezase Tsuri Master
+-rtrp18=Fishing Master
+-rtsevn=Totally Spies! Totally Party
+-rtsp41=Totally Spies! Totally Party
+-rttjaf=Tamagotchi no Furifuri Kagekidan
+-rtuekm=Secret Files: Tunguska
+-rtufkm=Secret Files: Tunguska
+-rtupkm=Secret Files: Tunguska
+-rtve64=Thrillville: Off the Rails
+-rtvp64=Thrillville: Off The Rails
+-rtwe5d=TNA iMPACT!
+-rtwp5d=TNA Impact
+-rtyp01=Wii Chess
+-rtze08=Zack & Wiki: Quest for Barbaro's Treasure
+-rtzj08=Takarajima Z Barbaros' Treasure
+-rtzk08=Zack & Wiki: Quest For Barbaros' Treasure
+-rtzp08=Zack & Wiki: Quest For Barbaros' Treasure
+-ru2e5z=Winter Sports 2: The Next Challenge 
+-ru2p5z=Winter Sports 2 The Next Challenge
+-ru3e5z=Summer Athletics: The Ultimate Challenge
+-ru7e5g=Night at the Museum: Battle of the Smithsonian The Video Game
+-ru7x5g=Night at the Museum: Battle of the Smithsonian The Video Game
+-ruae52=Monster Jam: Urban Assault
+-ruap52=Monster Jam: Urban Assault
+-rubevn=Ultimate Board Game Collection
+-rubp7n=Ultimate Board Game Collection
+-rubpvn=Ultimate Board Game Collection 12 Classics
+-ruce5z=Winter Sports: The Ultimate Challenge
+-rucxrt=Winter Sports
+-ruee4q=G-Force
+-ruep4q=G-Force
+-rufe99=Rune Factory: Frontier
+-rufj99=Rune Factory Frontier
+-rufp99=Rune Factory: Frontier
+-ruge7t=Goosebumps HorrorLand
+-rugp7t=Goosebumps: Horrorland
+-ruie4q=Disney: Sing It
+-ruip4q=Disney: Sing It
+-ruix4q=Disney: Sing It
+-rukegt=Rolling Stone: Drum King
+-rukpgt=We Rock: Drum King
+-rule4q=Ultimate Band
+-rulp4q=Ultimate Band
+-rume5z=Ski And Shoot
+-rumpfr=Summer Athletics
+-runj0q=New Unou Kids Wii EX
+-ruoepl=Aliens in the Attic
+-ruoppl=Aliens in the Attic
+-rupjc8=Winning Post 7 Maximum 2008
+-ruqe78=Up!
+-ruqp78=Up
+-ruqs78=Up!
+-rurepl=Pool Hall Pro
+-rurppl=Pool Hall Pro
+-ruse78=SpongeBob SquarePants featuring Nicktoons: Globs of Doom
+-rusk78=SpongeBob SquarePants featuring Nicktoons: Globs of Doom
+-rusx78=SpongeBob Squarepants: Globs Of Doom
+-rusy78=SpongeBob SquarePants featuring Nicktoons: Globs of Doom
+-ruue01=Animal Crossing: City Folk
+-ruuj01=Machi He Ikouyo Doubutsu No Mori
+-ruup01=Animal Crossing: Let's go to the City
+-ruwjc8=Winning Post World
+-ruxxug=Urban Extreme: Street Rage
+-ruze7t=Ultimate I SPY
+-rv2e5d=Game Party 2
+-rv2p5d=Game Party 2
+-rv8prt=Beach Fun: Summer Challenge
+-rv9e78=Avatar: The Last Airbender - Into the Inferno
+-rv9p78=Avatar - The Last Airbender: Into the Inferno
+-rvae78=Avatar: The Last Airbender - The Burning Earth
+-rvap78=Avatar - The Last Airbender: The Burning Earth
+-rvbers=Alvin & the Chipmunks
+-rvbprs=Alvin And The Chipmunks
+-rvdplg=Diabolik: The Original Sin
+-rvefmr=Bienvenue Chez Les Ch'tis
+-rvfe20=Bigfoot: Collision Course
+-rvfp7j=Bigfoot: Collision Course
+-rvge78=Merv Griffin's Crosswords
+-rvgp78=Merv Griffins Crosswords
+-rvie4f=Bionicle Heroes
+-rvip4f=Bionicle Heroes
+-rvlpa4=Rock Revolution
+-rvne20=Calvin Tucker's Redneck Jamboree
+-rvnp20=Calvin Tucker's Redneck Jamboree
+-rvnp7j=Calvin Tucker's Redneck Jamboree
+-rvoepl=Vertigo
+-rvoppl=Vertigo
+-rvpefs=PopStar Guitar
+-rvppfs=Pop Star Guitar
+-rvqe41=Movie Games
+-rvqp41=Movie Studios Party
+-rvrefs=Rebel Raiders: Operation Nighthawk
+-rvrpfs=Rebel Raiders: Operation Nighthawk
+-rvrpkg=Rebel Raiders: Operation Nighthawk
+-rvse69=Skate It
+-rvsj13=Skate It
+-rvsp69=Skate It
+-rvue8p=Virtua Tennis 2009
+-rvup8p=Virtua Tennis 2009
+-rvve78=Big Beach Sports
+-rvvp78=Big Beach Sports
+-rvxprt=RTL Biathlon 2009
+-rvyd52=Call Of Duty: World at War
+-rvye52=Call of Duty: World at War
+-rvyk52=Call of Duty: World at War
+-rvyp52=Call Of Duty: World At War
+-rvyy52=Call Of Duty: World At War
+-rvze52=Monsters vs. Aliens
+-rvzp52=Monsters vs. Aliens
+-rw3e4q=Pirates of the Caribbean: At World's End
+-rw3j4q=Pirates Of The Caribbean: At World's End
+-rw3p4q=Pirates Of The Caribbean: At World's End
+-rw4d41=My Word Coach: Develop your vocabulary
+-rw5f41=Qui Veut Gagner Des Millions: 2ème Edition
+-rw5p41=Who Wants To Be A Millionaire 2nd Edition
+-rw6pa4=Dance Dance Revolution: Winx Club
+-rw7e41=Shaun White Snowboarding: Road Trip
+-rw7p41=Shaun White Snowboarding: Road Trip
+-rw8p41=Imagine Champion Rider
+-rw9p78=WWE SmackDown! vs. RAW 2009 
+-rw9x78=WWE SmackDown vs. Raw 2009
+-rwad78=Wall-E
+-rwae78=WALL•E
+-rwaj78=WALL•E
+-rwak78=WALL•E
+-rwap78=WALL•E
+-rwau78=WALL•E
+-rwax78=WALL•E
+-rway78=WALL•E
+-rwbenr=Kawasaki Snow Mobiles
+-rwbxug=Kawasaki Snow Mobiles
+-rwce4z=Pinball Hall of Fame: The Williams Collection
+-rwcp4z=Pinball: Hall Of Fame
+-rwde5g=Wild Earth: African Safari
+-rwdp5g=Wild Earth: African Safari
+-rweea4=Pro Evolution Soccer 2008
+-rweja4=Winning Eleven Play Maker 2008
+-rwepa4=Pro Evolution Soccer 2008
+-rwfh41=My Word Coach
+-rwge08=We Love Golf!
+-rwgj08=We Love Golf!
+-rwgp08=We Love Golf!
+-rwhp4f=Top Trumps: Doctor Who
+-rwie18=Wing Island
+-rwij18=Wing Island
+-rwip18=Wing Island
+-rwjenr=WordJong Party
+-rwjpnr=Wordjong Party
+-rwke5g=Cooking Mama: World Kitchen
+-rwkp5g=Cooking Mama: World Kitchen
+-rwkpgt=Cooking Mama 2 World Kitchen
+-rwle01=Wario Land: Shake It!
+-rwlj01=Warioland Shake
+-rwlp01=Wario Land: The Shake Dimension
+-rwme78=Worms: A Space Oddity
+-rwmp78=Worms: A Space Oddity
+-rwoe69=Monopoly
+-rwoj13=Monopoly
+-rwop69=Monopoly
+-rwqpsp=WSC Real 08: World Championship Snooker
+-rwre4f=Wacky Races: Crash & Dash
+-rwrp4f=Wacky Races: Crash & Dash
+-rwse8p=Mario & Sonic at the Olympic Games
+-rwsj01=Mario & Sonic at the Olympic Games
+-rwsk01=Mario & Sonic at the Olympic Games
+-rwsp8p=Mario & Sonic at the Olympic Games
+-rwteg9=Ben 10: Alien Force
+-rwtpg9=Ben 10: Alien Force
+-rwue52=X-Men Origins: Wolverine
+-rwup52=X-Men Origins: Wolverine
+-rwux52=X-Men Origins: Wolverine
+-rwwe78=WWE SmackDown! vs. RAW 2008
+-rwwj78=WWE SmackDown vs. RAW 2008
+-rwwp78=WWE SmackDown! vs. RAW 2008
+-rwxes5=Brave: A Warrior's Tale
+-rwze5g=Wonder World Amusement Park
+-rwzp5g=Wonder World Amusement Park
+-rwzx5g=Wonder World Amusement Park
+-rx2p70=My Horse And Me 2
+-rx3e01=ExciteBots: Trick Racing
+-rx7jgd=Meja-maji March
+-rx8ja4=Jikkyou Powerful Pro Yakyuu Next
+-rx9e69=Need for Speed: Undercover
+-rx9j13=Need for Speed: Undercover
+-rx9k69=Need for Speed: Undercover 
+-rx9p69=Need for Speed: Undercover
+-rx9x69=Need for Speed: Undercover
+-rx9y69=Need for Speed: Undercover
+-rxbe70=Backyard Baseball '10
+-rxbp70=Backyard Baseball 10
+-rxce4z=Dave Mirra BMX Challenge
+-rxcp4z=Dave Mirra Bmx Challenge
+-rxdd4q=Disney Th!nk Fast
+-rxde4q=Disney TH!NK Fast
+-rxdj4q=Disney Th!nk Haya Oshi Quiz
+-rxdp4q=Disney Th!nk Fast
+-rxdx4q=Disney Th!nk Fast
+-rxejda=Major Wii Perfect Closer
+-rxfevn=Offshore Tycoon
+-rxhf5d=Chaos à La Maison
+-rxie52=Transformers: Revenge of the Fallen
+-rxip52=Transformers : Revenge of the Fallen
+-rxjjda=Jinsei Game Wii EX
+-rxkegl=TV Show King Party
+-rxkfgl=TV Show King Party
+-rxkpgl=TV Show King Party
+-rxle41=Grey's Anatomy: The Video Game
+-rxlp41=Grey's Anatomy
+-rxmj8p=Miburi & Teburi
+-rxpexs=Hooked!: Real Motion Fishing
+-rxpjjf=Bass Fishing Wii
+-rxppgt=Big Catch Bass Fishing
+-rxrers=The Tale of Despereaux
+-rxrprs=The Tale Of Despereaux
+-rxsea4=Dance Dance Revolution Hottest Party
+-rxspa4=Dancing Stage Hottest Party
+-rxue41=Surf's Up
+-rxup41=Surf's Up
+-rxux41=Surf's Up
+-rxwe20=M&M's Beach Party
+-rxxe4q=Spectrobes: Origins
+-rxye4z=Puzzle Challenge: Crosswords and more!
+-rxyp4z=Puzzle Challenge Crosswords
+-rxze52=Cabela's Dangerous Hunts 2009
+-rxzp52=Cabela's Dangerous Hunts 2009
+-ry2e41=Rayman Raving Rabbids 2
+-ry2j41=Rayman Raving Rabbids 2
+-ry2k41=Rayman Raving Rabbids 2
+-ry2p41=Rayman Raving Rabbids 2
+-ry3e41=Rayman Raving Rabbids TV Party
+-ry3j41=Rayman Raving Rabbids TV Party
+-ry3p41=Rayman Raving Rabbids: TV Party
+-ry5e52=Big League Sports: Summer Sports
+-ryajda=Yattaman Wii Bikkuridokkiri Machine De Mou Race Da Koron
+-rybe69=Boom Blox Bash Party
+-rybp69=Boom Blox: Bash Party 
+-rydelt=Pet Pals: Animal Doctor
+-rydp6v=Pet Pals: Animal Doctor
+-ryge9b=Rygar: The Battle of Argus
+-rygj9b=Argus No Senshi Muscle Impact
+-rygp99=Rygar: The Battle of Argus
+-rygp9b=Rygar: The Battle of Argus
+-ryhes5=Roogoo: Twisted Towers
+-ryie9b=SPRay
+-ryip9b=SPRay
+-rykeaf=We Ski & Snowboard
+-rykjaf=Family Ski World Ski And Snow Board
+-rykpaf=Family Ski & Snowboard
+-ryldsv=Germany's Next Topmodel
+-ryoea4=Yu-Gi-Oh! 5D's Wheelie Breakers
+-ryoja4=Yu-Gi-Oh! 5D's: Wheelie Breakers
+-ryqe69=Trivial Pursuit
+-ryqp69=Trivial Pursuit
+-ryte4z=PBR: Out of the Chute
+-ryvjms=Illvelo Wii
+-rywe01=Big Brain Academy: Wii Degree
+-rywj01=Wii de Yawaraka Atama Juku
+-rywk01=Big Brain Academy: Wii Degree
+-rywp01=Big Brain Academy: Wii Degree
+-ryxe20=Yamaha Supercross
+-ryxp20=Yamaha Supercross
+-ryxp7j=Yamaha Supercross
+-ryzptv=Play the World
+-rz2jg9=Simple Wii Series Vol. 1: The Minna de Kart Race
+-rz3jg9=Simple Wii Series Vol. 2: The Minna de Bass Tsuri Taikai
+-rz4jg9=Simple Wii Series Vol. 3: The Casino Party
+-rz5jg9=Simple Wii Series Vol. 4: The Shooting Action
+-rz6jg9=Simple Wii Series Vol. 5: The Block Kuzushi
+-rz7jg9=Simple Wii series Vol. 6: The Waiwai Konbatto
+-rz8jg9=Simple 2000 Series Wii Vol. 1: The Table Game
+-rz9eg9=Family Party: 30 Great Games
+-rz9jg9=Simple 2000 Series Wii Vol. 2: The Party Game
+-rz9pg9=Family Party: 30 Great Games
+-rzce6k=Saint
+-rzde01=The Legend of Zelda: Twilight Princess
+-rzdj01=The Legend Of Zelda: Twilight Princess
+-rzdp01=The Legend of Zelda: Twilight Princess
+-rzee52=Science Papa
+-rzfpkm=Secret Files 2: Puritas Cordis
+-rzhe5g=Zoo Hospital
+-rzhp5g=Zoo Hospital
+-rzhx5g=Zoo Hospital
+-rzke20=Puzzle Kingdoms
+-rzkp7j=Puzzle Kingdoms
+-rzpe01=Link's Crossbow Training
+-rzpj01=Link's Crossbow Training
+-rzpp01=Link's Crossbow Training
+-rzregt=The Destiny of Zorro
+-rzrpgt=The Destiny Of Zorro
+-rzsegj=Speed Zone
+-rzsy41=Mi Experto En Vocabulario
+-rzte01=Wii Sports Resort
+-rztj01=Wii Sports Resort
+-rztp01=Wii Sports Resort
+-rzue4z=Crayola Colorful Journey
+-rzye41=My Word Coach
+-rzyp41=My Word Coach: Develop your vocabulary
+-rzys41=Mi Experto En Vocabulario
+-rzze8p=Madworld
+-rzzp8p=MadWorld
+-st8p75=Sing It 80's
+-stap75=Sing It Apres Ski Hits
+-stcp75=Sing It Singstar
+-stdp75=Sing It Deutsch Rock-Pop
+-sthp75=Sing It Hottest Hits
+-stpp75=Sing It Pop Hits
+-stqp75=Sing It Queen
+-strp75=Sing It Rock Ballads
+-stsp75=Sing It Schlager
+-sxae52=Guitar Hero: World Tour
+-sxap52=Guitar Hero: World Tour
+-sxbe52=Guitar Hero: Metallica
+-sxbp52=Guitar Hero: Metallica
+-sxce52=Guitar Hero: Smash Hits
+-sxcp52=Guitar Hero: Greatest Hits
+-sxee52=Guitar Hero 5
+-sxep52=Guitar Hero 5
+-szae69=Rock Band 2
+-szap69=Rock Band 2
++010E01 = Wii 备份盘 v1.31(美)
++0TFE00 = 模拟NAND中游戏运行器(美)
++0TFP00 = 模拟NAND中游戏运行器(欧)
++0WME00 = Wad管理器 v1.5(美)
++BEPS01 = 自制 吉他英雄 下载版(西)
++C3BE52 = 自制 吉他英雄3 下载版(美)
++C3FP52 = 自制 吉他英雄3 下载版(欧)
++C3ME52 = 自制 吉他英雄3 下载版(美)
++C3PP52 = 自制 吉他英雄3 现代流行与摇滚(欧)
++C64J00 = Wii64 模拟器(日)
++C64P00 = 任天堂N64模拟器(欧)
++C80E52 = 自制 吉他英雄 下载版(美)
++C80P52 = 自制 吉他英雄3 下载版(欧)
++C9PP = 最后的忍者3(欧)
++C9QP = 跳转男子(欧)
++C9RP = 国际空手道+(欧)
++C9SP = 不可能的任务2(欧)
++C9XP = 最后的忍者(欧)
++C9YP = 国际空手道大赛(欧)
++C9ZP = 世界游戏(欧)
++CANE52 = 自制 吉他英雄 下载版(美)
++CCCE00 = Check Mii Out频道(美)
++CCCP00 = Check Mii Out频道(欧)
++CCRP00 = 都市打靶(欧)
++CDCP00 = 磁盘装载软件(欧)
++CDMP00 = 龙媒播放器(欧)
++CFCP00 = FCE Ultra任天堂FC模拟器(欧)
++CFTP00 = FTP服务器(欧)
++CG1E52 = 自制 吉他英雄3 下载版(美)
++CG1P52 = 自制 吉他英雄3 下载版(欧)
++CG2E52 = 自制 吉他英雄3 下载版(美)
++CG2EFL = 自制 吉他英雄3 下载版(美)
++CG2P52 = 自制 吉他英雄3 下载版(欧)
++CG3ECS = 自制 吉他英雄3 下载版(美)
++CG3PCS = 自制 吉他英雄 下载版(欧)
++CGBE52 = 自制 摇滚乐团(美)
++CGBP52 = 自制 吉他英雄3 摇滚乐队(欧)
++CGCP00 = GC备份加载器(欧)
++CGH3IM = 自制 吉他英雄3 下载版(欧)
++CGH3ME = 自制 吉他英雄3 下载版(欧)
++CGH3WD = 自制 吉他英雄3 下载版(欧)
++CGHE87 = 自制 吉他英雄3 下载版(美)
++CGHE88 = 自制 吉他英雄3 下载版(美)
++CGHE89 = 自制 吉他英雄3 下载版(美)
++CGHE90 = 自制 吉他英雄3 下载版(美)
++CGHE91 = 自制 吉他英雄3 下载版(美)
++CGHE92 = 自制 吉他英雄3 下载版(美)
++CGHE93 = 自制 吉他英雄3 下载版(美)
++CGHE94 = 自制 吉他英雄3 下载版(美)
++CGHE95 = 自制 吉他英雄3 下载版(美)
++CGHE96 = 自制 吉他英雄3 下载版(美)
++CGHE97 = 自制 吉他英雄3 下载版(美)
++CGHE98 = 自制 吉他英雄3 下载版(美)
++CGHE99 = 自制 吉他英雄3 下载版(美)
++CGHECB = 自制 吉他英雄3 下载版(美)
++CGHEDC = 自制 吉他英雄3 下载版(美)
++CGHEDM = 自制 吉他英雄3 下载版(美)
++CGHEMC = 自制 吉他英雄3 下载版(美)
++CGHENC = 自制 吉他英雄3 下载版(美)
++CGHEPH = 自制 吉他英雄3 下载版(美)
++CGHER2 = 自制 吉他英雄3 下载版(美)
++CGHPF2 = 自制 吉他英雄3 下载版(欧)
++CGHPF3 = 自制 吉他英雄3 下载版(欧)
++CGHPF4 = 自制 吉他英雄3 下载版(欧)
++CGHPF5 = 自制 吉他英雄3 下载版(欧)
++CGHPNT = 自制 吉他英雄 下载版(欧)
++CGHRH2 = 自制 吉他英雄3 摇滚精选v2(自)
++CGIE52 = 自制 吉他英雄 下载版(美)
++CGPP00 = 世嘉MD模拟器(欧)
++CGSP52 = 自制 吉他英雄 下载版(欧)
++CGVECD = 自制 吉他英雄 下载版(美)
++CGVEM2 = 自制 吉他英雄 下载版(美)
++CGVEMC = 自制 吉他英雄 下载版(美)
++CGVEUV = 自制 吉他英雄 下载版(美)
++CGXP00 = GeexBox播放器(欧)
++CHBP00 = 自制频道浏览器(欧)
++CHCE00 = 自制频道(美)
++CHCJ00 = 自制频道(日)
++CHCK00 = 自制频道(韩)
++CHCP00 = 自制频道(欧)
++CICE00 = 网络频道(美)
++CICP00 = 网络频道(欧)
++CJQP00 = 宝石探秘(欧)
++CLAPSI = 自制 唱吧 下载版(欧)
++CLMP00 = 自制程序装载器(欧)
++CMDE52 = 自制 吉他英雄3 下载版(美)
++CMIE00 = Mii频道(美)
++CMIP00 = Mii频道(欧)
++CMJP00 = 自制 麻将 Wii(欧)
++CMMP00 = 我的自制菜单(欧)
++CMPE00 = MPlayerCE播放器(欧)
++CMPP00 = MPlayer-CE播放器(欧)
++CNCE00 = 新闻频道(美)
++CNCP00 = 新闻频道(欧)
++CNGP00 = NeoGammA加载器(欧)
++CPCE00 = 照片频道(美)
++CPCP00 = 照片频道1.0_1.1(欧)
++CPLP00 = Priiloader(欧)
++CSCE00 = Wii购物频道(美)
++CSCP00 = 购物频道(欧)
++CSME00 = wii系统菜单(美)
++CSMP00 = 世嘉SMS模拟器(欧)
++CSNE00 = Snes9x超任模拟器(美)
++CSNP00 = Snes9x超任模拟器(欧)
++CSTP00 = Wii纸牌(欧)
++CSVE00 = ScummVM模拟器(美)
++CSVP00 = ScummVM模拟器(欧)
++CTFP00 = 模拟NAND中游戏运行器(欧)
++CVBP00 = VBA模拟器(欧)
++CWCE00 = 天气频道(美)
++CWCP00 = 天气频道(欧)
++CWEP00 = Wii地球(欧)
++CWMP00 = WAD管理器 v1.5(欧)
++CWRE00 = Wii电台(美)
++CWRP00 = Wii电台(欧)
++CWXP00 = Wii资源管理器(欧)
++DHKE18 = 努力工作的人(美)
++DMHE08 = 怪物猎人3试玩版(美)
++DMHJ08 = 怪物猎人3试玩版[WiFi](日)
++DMSP4Q = 迪斯尼电影 想唱就唱(欧)
++DQAJK2 = 水瓶座棒球(日)
++DRP22Q = 自制 唱吧 下载版(欧)
++DZDE01 = 塞尔达传说 黎明公主 试玩版(美)
++E62P = 太空哈利(欧)
++E6NP = 所罗门之钥(欧)
++E6VP = 立体空战(欧)
++E6XP = 兽王记(欧)
++E7FJ = 龙魂2(日)
++E7GJ = 龙魂(日)
++EA2P = 合金弹头2(欧)
++EAAP = 饿狼传说(欧)
++EAEP = 侍魂(欧)
++EAJP = 合金弹头(欧)
++EANP = 饿狼传说2(欧)
++EASP = 侍魂2(欧)
++FA4P = 恶魔世界(欧)
++FA6P = 大金刚数学(欧)
++FA7P = 马里奥和耀西(欧)
++FA8F = 卡比的冒险(法)
++FA8P = 卡比的冒险(欧)
++FA9P = 塞尔达 林克的冒险(欧)
++FAAP = 大金刚(欧)
++FABP = 大金刚jr(欧)
++FACP = 弹珠台(欧)
++FAFP = 马里奥兄弟(欧)
++FAGP = 超级马里奥兄弟(欧)
++FAHP = 网球(欧)
++FAIP = 足球(欧)
++FAJP = 冰上曲棍球(欧)
++FAKP = 塞尔达传说(欧)
++FALP = 棒球(欧)
++FAMP = 瓦里奥森林(欧)
++FANP = 街头格斗小子(欧)
++FAOP = 所罗门之匙(欧)
++FAPP = NES高尔夫公开赛(欧)
++FAQL = 忍者茶茶丸(自)
++FARP = 宇宙巡航舰(欧)
++FASP = 铁板阵(欧)
++FAXP = 吃豆人(欧)
++FB2L = 超级马里奥兄弟：最后的等级(自)
++FB4P = 月宫桌球(欧)
++FBAL = 桌球(自)
++FBBP = 机车大赛(欧)
++FBCP = 越野机车(欧)
++FBDP = 光之神话天使岛传说(欧)
++FBEP = 敲冰块(欧)
++FBHP = 恶魔城(欧)
++FBIP = 出拳 出击!!(欧)
++FBJP = 炸弹人杰克(欧)
++FBKP = 忍者神龟(欧)
++FBLM = 挖金战斗(自)
++FBNM = 忍者外传(自)
++FBRP = 大蜜蜂(欧)
++FBSM = 迷宮組曲(自)
++FBUP = 洛洛大冒险(欧)
++FBYP = 超级马里奥兄弟2(欧)
++FBZP = 银河战士(欧)
++FC3P = 泡泡龙(欧)
++FC6P = 星之海洋(欧)
++FC8P = 恶魔城2 西蒙的寻找(欧)
++FCPP = 气球大战(欧)
++FCRP = 冒险岛(欧)
++FCSP = 魂斗罗二代 邪恶势力返回(欧)
++FCTP = 洛克人(欧)
++FCUP = 排球(欧)
++FCVP = 敲砖工(欧)
++FCWP = 超级马里奥兄弟3(欧)
++FCYP = 耀西的饼干(欧)
++FD2P = 双截龙(欧)
++FD6P = 罗罗大冒险2(欧)
++FD7P = 洛克人3(欧)
++FDAM = 地底冒险(自)
++FDGP = 大魔界村(欧)
++FDNP = 洛克人(欧)
++FDOP = 野狼行动(欧)
++FDPP = 冰上曲棍球(欧)
++FDQP = 两次运球(欧)
++FDRP = 滑板与死亡(欧)
++FDVP = 街头帮派(欧)
++FEDL = 钻地小子(自)
++FEIP = 碰碰车(欧)
++FEML = 生命的奇迹-超级宝宝(自)
++FEQP = 恶魔城3 德库拉的诅咒(欧)
++FERM = 星之海洋2(自)
++FESP = 库鲁库鲁大陆(欧)
++FEUP = 大金钢3(欧)
++FFEP = 男孩与泡泡怪(欧)
++HMBE00 = Multiboot(美)
++HMME00 = 我的自制菜单(美)
++HSDE00 = SuperDump 1.3(美)
++HWME00 = Wad管理器 v1.5(美)
++HWRE00 = Wii电台(美)
++JA4P = 超魔界村R(欧)
++JA6E = 僵尸邻居(美)
++JA6P = 僵尸邻居(欧)
++JAEP = 大金刚世界(欧)
++JAVP = 超级银河战士(欧)
++JBTP = 超级战士(欧)
++JCJP = 超级出拳出局(欧)
++JDNE = 鬼屋历险(美)
++L40P4Q = 自制 唱吧 下载版(欧)
++MECPSI = 自制 唱吧 下载版(欧)
++MIJPSI = 自制 唱吧 下载版(欧)
++MILPSI = 自制 唱吧 下载版(欧)
++NAAE = 超级马里奥64(美)
++NAAP = 超级马里奥64(欧)
++NABE = 马里奥赛车64(美)
++NABP = 马里奥赛车64(欧)
++NACE = 塞尔达传说 时光之笛(美)
++NACP = 塞尔达传说 时光之笛(欧)
++NADE = 星际火狐64(美)
++NADP = 火狐战队(欧)
++NAEE = 纸片马里奥(美)
++NAEP = 纸片马里奥(欧)
++NAFE = 未来赛车X(美)
++NAFP = 未来赛车X(欧)
++NAHE = 耀西的故事(美)
++NAHP = 耀西的故事(欧)
++NAIE = 水上摩托64(美)
++NAIP = 水上摩托64(欧)
++NAJL = 罪与罚(自)
++NAJN = 罪与罚(自)
++NAKD = 口袋妖怪 即可拍(德)
++NAKE = 口袋妖怪 即可拍(美)
++NAKF = 口袋妖怪 即可拍(法)
++NAKI = 口袋妖怪 即可拍(意)
++NAKP = 口袋妖怪 即可拍(欧)
++NAKS = 口袋妖怪 即可拍(西)
++NALE = 任天堂明星大乱斗(美)
++NALP = 任天堂明星大乱斗(欧)
++NAME = 星之卡比64 水晶碎片(美)
++NAMP = 星之卡比64 水晶碎片(欧)
++NAND = 口袋妖怪谜题联盟(德)
++NANE = 口袋妖怪谜题联盟(美)
++NANF = 口袋妖怪谜题联盟(法)
++NANP = 口袋妖怪谜题联盟(欧)
++NAOE = 1080度 单板滑雪(美)
++NAOP = 1080度 单板滑雪(欧)
++NARP = 塞尔达传说 姆吉拉的假面(欧)
++NASE = 极速狂飙(美)
++NASP = 极速狂飙(欧)
++NAUE = 马里奥高尔夫(美)
++NAUP = 马里奥高尔夫(欧)
++ONKELZ = 自制 唱吧 下载版(美)
++OTFPSI = 自制 唱吧 下载版(欧)
++POPPSI = 自制 唱吧 下载版(欧)
++R01PET = 自制 唱吧 下载版(欧)
++R02PEA = 自制 唱吧 下载版(欧)
++R15POH = 自制 唱吧 下载版(欧)
++R23E52 = 芭比与三个火枪手(美)
++R23P52 = 芭比与三个火枪手(欧)
++R24J01 = 用Wii游玩小小机器人(日)
++R26E5G = 街机经典(美)
++R27E54 = 小探险家多拉 多拉拯救水晶王国(美)
++R27X54 = 小探险家多拉 多拉拯救水晶王国(X)
++R29E52 = 世界彩弹锦标赛2009(美)
++R29P52 = 世界彩弹锦标赛2009(欧)
++R2AE7D = 冰河世纪2 消融(美)
++R2AP7D = 冰河世纪2 消融(欧)
++R2AX7D = 冰河世纪2 消融(X)
++R2DEEB = 多卡波王国(美)
++R2DJEP = 多卡波王国for Wii(日)
++R2DPAP = 多卡波王国(欧)
++R2EJ99 = 鱼之眼Wii(日)
++R2FE5G = 小鱼弗雷迪 丢失的海藻种盒(美)
++R2FP70 = 小鱼弗雷迪 丢失的海藻种盒(欧)
++R2GEXJ = 废墟迷宫 再见月的废墟(美)
++R2GJAF = 废墟 再见月的废墟(日)
++R2GP99 = 废墟迷宫 再见月的废墟(欧)
++R2HE41 = 想象 冠军骑士(美)
++R2IE69 = 美式橄榄球大联盟10[WiFi](美)
++R2IP69 = 美式橄榄球大联盟10[WiFi](欧)
++R2JJAF = 太鼓达人Wii(日)
++R2KE54 = 唐金拳击[平衡板](美)
++R2KP54 = 唐金拳击[平衡板](欧)
++R2LJMS = 草裙舞Wii[平衡板](日)
++R2ME20 = 巧克力豆大冒险(美)
++R2NE69 = 纳斯卡卡丁车赛(美)
++R2NP69 = 纳斯卡卡丁车赛(欧)
++R2OE68 = 中世纪游戏(美)
++R2OP68 = 中世纪游戏(欧)
++R2PE9B = 魔法飞球2(美)
++R2PJ9B = 魔法飞球2(日)
++R2PKZ4 = 魔法飞球2(韩)
++R2PP99 = 魔法高尔夫(欧)
++R2PP9B = 魔法高尔夫(欧)
++R2QJC0 = 料理妈妈 世界厨房(日)
++R2RE4F = 小马伙伴2(美)
++R2RP4F = 小马伙伴2(欧)
++R2SE18 = 德卡运动会2[WiFi](美)
++R2SJ18 = 德卡运动会2(日)
++R2SP18 = 德卡运动会2(欧)
++R2TE41 = 忍者神龟 毁灭[WiFi](美)
++R2TP41 = 忍者神龟 毁灭[WiFi](欧)
++R2UE8P = 一起来敲打(美)
++R2UJ8P = 一起来敲打(日)
++R2UP8P = 一起来敲打(欧)
++R2VE01 = 罪与罚2(美)
++R2VJ01 = 罪与罚 宇宙的后继者[WiFi](日)
++R2VP01 = 罪与罚2[WiFi](欧)
++R2WEA4 = 实况足球2009[WiFi](美)
++R2WJA4 = 实况足球2009[WiFi](日)
++R2WPA4 = 实况足球2009[WiFi](欧)
++R2WXA4 = 实况足球2009[WiFi](X)
++R2YE54 = 我的生日(美)
++R2YP54 = 我的生日(欧)
++R32J01 = 用Wii玩银河战士Prime2黑暗回音(日)
++R33E69 = 摇滚乐团 乐曲扩展包2(美)
++R33P69 = 摇滚乐团 乐曲扩展包2(欧)
++R34E69 = 摇滚乐团 乡村音乐包(美)
++R35JC8 = 三国志11 威力加强版(日)
++R37E69 = 摇滚乐队 金属 乐曲包(美)
++R38E78 = 漫画超级英雄战队(美)
++R38P78 = 漫画超级英雄战队(欧)
++R38X78 = 漫画超级英雄战队 沃尔玛版(X)
++R38Y78 = 漫画超级英雄战队(Y)
++R39EFP = 禧码诺极限钓鱼(美)
++R3AE20 = 故事时间 冒险故事(美)
++R3AP20 = 故事时间 冒险故事(欧)
++R3AP7J = 故事时间 冒险故事(欧)
++R3BE8P = 快乐桑巴[WiFi](美)
++R3BJ8P = 快乐桑巴[WiFi](日)
++R3BP8P = 快乐桑巴[WiFi](欧)
++R3CE20 = 克莱斯勒经典赛车(美)
++R3CP20 = 克莱斯勒经典赛车(欧)
++R3CP7J = 克莱斯勒经典赛车(欧)
++R3DES5 = 梦幻弹球3D(美)
++R3DPS5 = 梦幻弹球3D(欧)
++R3EEWR = 游戏派对3(美)
++R3EPWR = 游戏聚会3(欧)
++R3FJA4 = 实况力量棒球大联盟3(日)
++R3GXUG = 国际儿童 疯狂小型高尔夫(X)
++R3HP6Z = 特工雨果 热带假期(欧)
++R3HX6Z = 特工雨果 热带假期(X)
++R3IJ01 = 用Wii玩银河战士Prime(日)
++R3JE5G = 去玩吧马戏团明星[平衡板](美)
++R3KP6N = 摩天大楼(欧)
++R3ME01 = 银河战士Prime 三部曲(美)
++R3MP01 = 银河战士Prime 三部曲(欧)
++R3NEXS = 罪恶装备XX Accent Core 加强版(美)
++R3PE52 = 极速赛车手(美)
++R3PEWR = 极速赛车手(美)
++R3PJ52 = 极速赛车手(日)
++R3PPWR = 极速赛车手(欧)
++R3RE8P = 索尼克与世嘉全明星赛车(美)
++R3RP8P = 索尼克与世嘉全明星赛车(欧)
++R3SE52 = 蜘蛛侠 影之网(美)
++R3SP52 = 蜘蛛侠 影之网(欧)
++R3TE54 = 上旋高手3(美)
++R3TJG9 = 上旋高手3(日)
++R3TP54 = 上旋高手3(欧)
++R3UJGD = 亲子游戏 米菲兔的玩具(日)
++R3VEFP = 麋鹿猎人(美)
++R3VPFP = 麋鹿猎人(欧)
++R3XE6U = 山姆和迈克斯第一季(美)
++R3XP6V = 山姆和迈克斯第一季(欧)
++R3YE70 = 山姆和麦克斯2 超越时空(美)
++R3YP70 = 山姆和麦克斯2 超越时空(欧)
++R3ZE69 = 摇滚乐队乐曲包 经典摇滚(美)
++R42E69 = 模拟人生2 生存游戏(美)
++R42P69 = 模拟人生2 生存游戏(欧)
++R43E69 = EA运动活力[平衡板](美)
++R43J13 = EA运动活力[平衡板](日)
++R43P69 = EA运动活力[平衡板](欧)
++R44J8P = 凉宫春日的并列(日)
++R46ENS = 灵武战记Wii(美)
++R46JKB = 灵武战记Wii(日)
++R47E20 = ATV沙滩车之王(美)
++R48E7D = 奇幻精灵事件簿(美)
++R48P7D = 奇幻精灵事件簿(欧)
++R49E01 = 大金刚 丛林敲击(美)
++R49J01 = 大金刚 丛林敲击(日)
++R49P01 = 大金刚 丛林敲击(欧)
++R4AE69 = 模拟动物(美)
++R4AJ13 = 模拟动物(日)
++R4AP69 = 模拟动物(欧)
++R4BEJZ = 桌面足球(美)
++R4BPGT = 桌面足球(欧)
++R4CE69 = 模拟城市 建筑大师[WiFi](美)
++R4CJ13 = 模拟城市 建筑大师[WiFi](日)
++R4CK69 = 模拟城市 建筑大师[WiFi](韩)
++R4CP69 = 模拟城市 建筑大师[WiFi](欧)
++R4DDUS = 三个问号 高校之迷(德)
++R4EE01 = 永恒蔚蓝 蓝色世界(美)
++R4EJ01 = 永恒蔚蓝2 海的呼唤(日)
++R4EP01 = 永恒蔚蓝2(欧)
++R4FE20 = 故事时间 童话故事(美)
++R4FP20 = 故事时间 童话故事(欧)
++R4FP7J = 故事时间 童话故事(欧)
++R4IPNK = 疯狂玩具车(欧)
++R4LXUG = 田径猪派对(X)
++R4MJ0Q = 使头脑变灵活Wii(日)
++R4NE5G = 大小调的庄严进行曲(美)
++R4NP5G = 大小调的庄严进行曲(欧)
++R4PE69 = 模拟人生2 宠物(美)
++R4PP69 = 模拟人生2 宠物(欧)
++R4QE01 = 马里奥激情足球[WiFi](美)
++R4QJ01 = 马里奥激情足球[WiFi](日)
++R4QK01 = 马里奥激情足球[WiFi](韩)
++R4QP01 = 马里奥激情足球[WiFi](欧)
++R4RE69 = FIFA足球10[WiFi](美)
++R4RJ13 = FIFA足球10[WiFi](日)
++R4RP69 = FIFA足球10[WiFi](欧)
++R4RX69 = FIFA足球10[WiFi](X)
++R4RY69 = FIFA足球10[WiFi](Y)
++R4RZ69 = FIFA足球10[WiFi](美)
++R4SE54 = 北美职棒超明星(美)
++R4VEA4 = 故事绘本工坊(美)
++R4VJA4 = 电视剧场Wii[WiFi](日)
++R4VJAF = 电视剧场Wii[WiFi](日)
++R4WJA4 = 实况力量棒球大联盟2009(日)
++R4YJ2M = 猫社长蕾娜Wii(日)
++R4ZE01 = 零月蚀之假面(美)
++R4ZJ01 = 零 月蚀之假面(日)
++R52E08 = 尼奥宠物谜题大冒险(美)
++R52P08 = 尼奥宠物谜题大冒险[WiFi](欧)
++R54FMR = 倒数游戏(法)
++R55F41 = 谁想成为百万富翁(法)
++R55P41 = 谁想成为百万富翁(欧)
++R56EG9 = 铁臂阿童木(美)
++R56PG9 = 铁臂阿童木(欧)
++R57FMR = 联合答题冠军(法)
++R58DMR = 你来唱[麦克风](德)
++R58FMR = 你来唱[麦克风](法)
++R58PMR = 你来唱[麦克风](欧)
++R58SMR = 你来唱[麦克风](西)
++R5AE8P = 黄金罗盘(美)
++R5AP8P = 黄金罗盘(欧)
++R5AX8P = 黄金罗盘(X)
++R5EPMR = 倒计时(欧)
++R5FE41 = 冠军学院 足球[MP][平衡板](美)
++R5FP41 = 冠军学院 足球[MP][平衡板](欧)
++R5GE78 = 你比五年级生聪明吗(美)
++R5IE4Q = 玩具总动员(美)
++R5IP4Q = 玩具总动员(欧)
++R5IX4Q = 玩具总动员(X)
++R5JES5 = 海盗VS忍者 躲避球(美)
++R5JPS5 = 海盗VS忍者 躲避球(欧)
++R5MJAF = 语言解谜 文字拼词Wii豪华版(日)
++R5NJN9 = 多阿拉Wii(日)
++R5OENR = 田径猪派对(美)
++R5OXUG = 田径猪派对(X)
++R5PE69 = 哈利波特与凤凰社(美)
++R5PJ13 = 哈利波特与凤凰社(日)
++R5PP69 = 哈利波特与凤凰社(欧)
++R5PX69 = 哈利波特与凤凰社(X)
++R5SERW = 幽灵庄园的秘密(美)
++R5TE69 = 大满贯网球[MP][WiFi](美)
++R5TJ13 = 大满贯网球[MP][WiFi](日)
++R5TP69 = 大满贯网球[MP][WiFi](欧)
++R5UE41 = 犯罪现场调查 致命意图(美)
++R5UP41 = CSI犯罪现场 致命意图(欧)
++R5VE41 = 神之化身 詹姆斯·卡麦隆(美)
++R5VP41 = 阿凡达(欧)
++R5VX41 = 神之化身 詹姆斯·卡麦隆(X)
++R5WEA4 = 寂静岭 破碎的记忆(美)
++R5WJA4 = 寂静岭 破碎的记忆(日)
++R5XJ13 = 我的模拟人生 特工(日)
++R5XP69 = 我的模拟人生 特工(欧)
++R5YD78 = 全明星啦啦队[平衡板](德)
++R5YE78 = 全明星啦啦队2[平衡板](美)
++R5YP78 = 全明星啦啦队2[平衡板](欧)
++R62E4Q = 迪士尼 想唱就唱 流行节奏(美)
++R62P4Q = 迪士尼 想唱就唱 流行节奏(欧)
++R63EG9 = 家庭聚会 30款有趣的户外游戏(美)
++R63PG9 = 家庭聚会 30款有趣的户外游戏(欧)
++R64E01 = Wii音乐[平衡板][WiFi](美)
++R64J01 = Wii音乐[平衡板][WiFi](日)
++R64K01 = Wii音乐[平衡板][WiFi](韩)
++R64P01 = Wii音乐[平衡板][WiFi](欧)
++R65ENR = 猎鹿狂(美)
++R66E41 = 按你的运气 2010版(美)
++R67E6K = 聪明系列出品 佳佳的冒险(美)
++R68E5G = 去玩吧 城市运动[平衡板](美)
++R69E36 = 尘埃2(美)
++R69P36 = 尘埃2(欧)
++R6APPU = 宝贝和我(欧)
++R6BE78 = 颜料宝贝(美)
++R6BJ78 = 颜料宝贝(日)
++R6BK78 = 颜料宝贝(韩)
++R6BP78 = 颜料宝贝(欧)
++R6BX78 = 颜料宝贝(X)
++R6CEAF = 大家的啦啦队2(美)
++R6DFJW = 警告 公路规则(法)
++R6EE41 = 家庭智力抢答 2010版(美)
++R6FE41 = 六旗主题乐园(美)
++R6FERS = 六旗主题乐园(美)
++R6FP41 = 欢乐园聚会(欧)
++R6GPMR = 黄金球(欧)
++R6HE54 = 你好，开兰 超级游戏日(美)
++R6IE54 = 棒球冲击波[MP](美)
++R6JJGD = 钢之炼金术师 晓之王子(日)
++R6KP36 = 灰烬杯板球2009(欧)
++R6KU36 = 灰烬杯板球赛2009(英)
++R6LEWR = 乐高摇滚乐队(美)
++R6LPWR = 乐高摇滚乐团(欧)
++R6MPML = 全美超模大赛(欧)
++R6NE41 = 肖恩怀特滑雪 世界舞台[MP][平衡板](美)
++R6NY41 = 肖恩怀特滑雪 世界舞台[MP][平衡板](Y)
++R6OE78 = 汽车总动员 奥拉玛大奖赛(美)
++R6OP78 = 赛车总动员 竞速(欧)
++R6OX78 = 赛车总动员 竞速(X)
++R6QE69 = 我的模拟人生 特工(美)
++R6TEA4 = 龙卷风爆发(美)
++R6TPA4 = 龙卷风爆发(欧)
++R6VE4Z = 俱乐部之王(美)
++R6VPGN = 俱乐部之王(欧)
++R6WE68 = AMF保龄球世界(美)
++R6WP68 = AMF保龄球世界(欧)
++R6XE69 = 家庭游戏之夜(美)
++R6XP69 = 家庭游戏之夜(欧)
++R6YEXS = 橡皮球聚会(美)
++R6YPH3 = 橡皮球聚会(欧)
++R72E5G = 蛋糕工坊 混合(美)
++R72P5G = 蛋糕工坊 混合[WiFi](欧)
++R74E20 = 商场射击馆(美)
++R75E20 = 梦幻沙龙(美)
++R76E54 = NBA 2010[WiFi](美)
++R76P54 = NBA 2010[WiFi](欧)
++R77JAF = SD高达G世纪 战争(日)
++R79JAF = 机动战士高达 MS战线0079(日)
++R7AE69 = 模拟动物 非洲(美)
++R7AJ13 = 模拟动物 非洲(日)
++R7AP69 = 模拟动物 非洲(欧)
++R7BE20 = 吉利贝利 弹道豆(美)
++R7BP7J = 吉利贝利 弹道豆(欧)
++R7CJ01 = 彩虹队长(日)
++R7CP01 = 彩虹队长(欧)
++R7EE8P = 梦精灵 星降夜物语[WiFi](美)
++R7EJ8P = 梦精灵 星降夜物语[WiFi](日)
++R7EP8P = 梦精灵 星降夜物语[WiFi](欧)
++R7FEGD = 陆行鸟 忘却时间的迷宫[WiFi](美)
++R7FJGD = 陆行鸟 忘却时间的迷宫[WiFi](日)
++R7FPGD = 陆行鸟 忘却时间的迷宫[WiFi](欧)
++R7GEAF = 龙珠 天下第一大冒险(美)
++R7GJAF = 龙珠 天下第一大冒险(日)
++R7GPAF = 龙珠 天下第一大冒险(欧)
++R7HE6K = 救兵总动员(美)
++R7IE69 = 魅力女孩俱乐部[平衡板](美)
++R7IP69 = 魅力女孩俱乐部 睡衣派对[平衡板](欧)
++R7KE6K = 岩石疾风(美)
++R7LP7J = 玛格的困惑!(欧)
++R7MXFR = 音乐派对 轰动全场(欧)
++R7NE20 = 酷圣石 冰激凌来一勺(美)
++R7OE54 = 北美冰球联盟2010[MP][WiFi](美)
++R7OP54 = 北美冰球联盟2010[MP][WiFi](欧)
++R7PE01 = 拳王争霸[平衡板](美)
++R7PJ01 = 拳王争霸[平衡板](日)
++R7PP01 = 拳王争霸[平衡板](欧)
++R7QE52 = 混沌影子武士(美)
++R7RE52 = 小联盟世界锦标赛2009(美)
++R7SE5G = 逃出博物馆(美)
++R7SP5G = 逃出博物馆(欧)
++R7TFJW = 法式滚球(法)
++R7WE52 = 雪山运动[平衡板](美)
++R7WP52 = 雪山运动[平衡板](欧)
++R7XE69 = 极品飞车 氮气(美)
++R7XJ13 = 极品飞车 氮气(日)
++R7XP69 = 极品飞车 氮气(欧)
++R7YFMR = 北京快车(法)
++R7ZE41 = 团体淘汰赛(美)
++R7ZP41 = 淘汰派对(欧)
++R82E52 = 动物星球 兽医(美)
++R82JG0 = 飞标Wii DX(日)
++R82P52 = 动物星球 兽医(欧)
++R83EA4 = 流行音乐(美)
++R83JA4 = 流行音乐Wii(日)
++R83PA4 = 流行音乐(欧)
++R84EE9 = 牧场物语Wii 安稳之树(美)
++R84J99 = 牧场物语Wii 安稳之树(日)
++R84P99 = 牧场物语 济世之树(欧)
++R85EG9 = 秘密星期六 第五太阳之兽(美)
++R85PG9 = 秘密星期六 第五日之兽(欧)
++R86E20 = 梦之舞蹈啦啦队[平衡板](美)
++R87EVN = 斯基度雪地车挑战赛(美)
++R89JEL = 东京友好乐园2(日)
++R8AJ01 = 口袋妖怪乐园 皮卡丘大冒险(日)
++R8BE41 = 保姆派对[平衡板](美)
++R8BP41 = 保姆派对[平衡板](欧)
++R8CE20 = 梦之舞蹈啦啦队[平衡板](美)
++R8FES5 = 快餐危机(美)
++R8FJHA = 匠餐厅大繁盛!(日)
++R8FPNP = 快餐狂(欧)
++R8GJC8 = GI骑师联盟2008[平衡板][WiFi](日)
++R8GPC8 = GI骑师联盟2008[平衡板][WiFi](欧)
++R8HE4Q = 汉娜 蒙塔娜 电影版(美)
++R8HP4Q = 汉娜 蒙塔娜 电影版(欧)
++R8HX4Q = 汉娜 蒙塔娜 电影版(X)
++R8HY4Q = 汉娜 蒙塔娜 电影版(Y)
++R8IE78 = 海绵宝宝 诚实还是正直(美)
++R8IP78 = 海绵宝宝 诚实还是正直(欧)
++R8KPKM = 街头足球 尼科拉斯阿内尔卡(欧)
++R8LE20 = 爆裂小鸡猎杀者(美)
++R8LP7J = 爆裂小鸡猎杀者(欧)
++R8NJG0 = 日本棒球机构承认 击球革命[MP](日)
++R8OE54 = 玲玲马戏团[平衡板](美)
++R8OX54 = 我的马戏团(X)
++R8PE01 = 超级纸片马里奥(美)
++R8PJ01 = 超级纸片马里奥(日)
++R8PK01 = 超级纸片马里奥(韩)
++R8PP01 = 超级纸片马里奥(欧)
++R8RP41 = 亚瑟与他的迷你王国2[平衡板](欧)
++R8SE41 = 假日体育(美)
++R8SP41 = 假日体育(欧)
++R8SX41 = 假日体育(X)
++R8TENR = 台球巡回赛(美)
++R8UXMR = 阿迪波冒险记(X)
++R8VE41 = 拯救地球 野生动物兽医(美)
++R8VP41 = 拯救地球 野生动物兽医(欧)
++R8XE52 = 侏罗纪 猎物(美)
++R8YE52 = 卡贝拉猎人2010(美)
++R8ZE8P = 大师教你普拉提[平衡板](美)
++R92J01 = 用Wii玩皮克敏2(日)
++R92P01 = 用Wii玩皮克敏2(欧)
++R94PMR = 终极红球挑战赛(欧)
++R94XMR = 终极红球挑战赛(X)
++R96EAF = 风之克罗诺亚 幻影之门(美)
++R96JAF = 风之克罗诺亚 幻影之门(日)
++R96KAF = 风之克罗诺亚 幻影之门(韩)
++R96PAF = 风之克罗诺亚 幻影之门(欧)
++R97E9B = 家庭欢乐橄榄球(美)
++R9BPMT = 鲍勃工程队 欢乐节庆(欧)
++R9CPMR = 我是明星 快放我走(欧)
++R9DE78 = 描绘生命 下一章(美)
++R9DP78 = 描绘生命 下一章(欧)
++R9EPNP = 修理派对(欧)
++R9FE36 = 一级方程式赛车2009(美)
++R9FJ36 = 一级方程式赛车2009(日)
++R9FP36 = 一级方程式赛车2009(欧)
++R9HE78 = 你比五年级生聪明吗？(美)
++R9IE01 = 用Wii玩皮克敏(美)
++R9IJ01 = 用Wii玩皮克敏(日)
++R9IP01 = 用Wii玩皮克敏(欧)
++R9JE69 = 甲壳虫 摇滚乐队[WiFi](美)
++R9JP69 = 甲壳虫 摇滚乐队[WiFi](欧)
++R9KE20 = 律动方块(美)
++R9LE41 = 通宵派对[平衡板](美)
++R9LP41 = 女孩生活 通宵派对[平衡板](欧)
++R9ME5Z = 夏季运动会2009[平衡板](美)
++R9MPFR = 夏季运动会2009[平衡板](欧)
++R9NPMR = 家族财富(欧)
++R9OE69 = 泰格伍兹高尔夫巡回10[MP][WiFi](美)
++R9OK69 = 泰格伍兹高尔夫巡回10[MP][WiFi](韩)
++R9OP69 = 泰格伍兹高尔夫巡回10[MP][WiFi](欧)
++R9RPNG = 舞蹈派对 流行精选[跳舞毯](欧)
++R9SPPL = 球形数独 侦探(欧)
++R9TE69 = 泰格伍兹高尔夫巡回09[WiFi](美)
++R9TJ13 = 泰格伍兹高尔夫巡回09[WiFi](日)
++R9TK69 = 泰格伍兹高尔夫巡回09[WiFi](韩)
++R9TP69 = 泰格伍兹高尔夫巡回09[WiFi](欧)
++R9UE52 = 熊熊工坊 友谊谷(美)
++R9UPGY = 熊熊工坊 友谊谷(欧)
++R9VE52 = 坎贝拉野外冒险2010(美)
++R9WPSP = WSC真实09世界斯诺克大奖赛(欧)
++R9XE52 = 街机地带(美)
++R9XP52 = 街机地带(欧)
++R9ZE54 = 职棒大联盟2K9(美)
++R9ZP54 = 职棒大联盟2K9(欧)
++RB2E6K = 气球泡泡(美)
++RB2J2K = 气球泡泡(日)
++RB2P6K = 气球泡泡(欧)
++RB2PGT = 气球泡泡(欧)
++RB4E08 = 生化危机4(美)
++RB4J08 = 生化危机4(日)
++RB4P08 = 生化危机4(欧)
++RB4X08 = 生化危机4(X)
++RB5E41 = 战火兄弟连 双重时间(美)
++RB5P41 = 战火兄弟连 双重时间(欧)
++RB6J18 = 炸弹人大陆[WiFi](日)
++RB7E54 = 恶霸鲁尼 学院风云(美)
++RB7P54 = 恶霸鲁尼 学院风云(欧)
++RB8E70 = 后院棒球09(美)
++RB9D78 = 布拉兹娃娃电影版(德)
++RB9E78 = 布拉兹娃娃电影版(美)
++RB9P78 = 布拉兹娃娃电影版(欧)
++RBAE41 = 炽天使 二战空骑兵(美)
++RBAP41 = 炽天使 二战空骑兵(欧)
++RBBE18 = 炸弹人乐园(美)
++RBBJ18 = 炸弹人乐园(日)
++RBBP99 = 炸弹人乐园(欧)
++RBCP41 = 电视迷(欧)
++RBEE52 = 蜜蜂总动员(美)
++RBEP52 = 蜜蜂总动员(欧)
++RBEX52 = 蜜蜂总动员(X)
++RBFE20 = 乒乓特种兵(美)
++RBFP20 = 乒乓特种兵(欧)
++RBFP7J = 乒乓特种兵(欧)
++RBGE54 = 职业棒球联赛(美)
++RBGP54 = 职业棒球联赛(欧)
++RBHE08 = 生化危机0(美)
++RBHJ08 = 生化危机0(日)
++RBHP08 = 生化危机0(欧)
++RBIEE9 = 牧场物语 欢欣雀跃的动物进行曲(美)
++RBIJ99 = 牧场物语 欢乐动物进行曲(日)
++RBKE69 = 轰炸方块[WiFi](美)
++RBKJ13 = 轰炸方块(日)
++RBKK69 = 轰炸方块(韩)
++RBKP69 = 轰炸方块(欧)
++RBLE8P = 死神 白刃闪耀圆舞曲(美)
++RBLJ8P = 死神 白刃闪耀圆舞曲(日)
++RBLP8P = 死神 白刃闪耀圆舞曲(欧)
++RBME5G = 泡泡龙(美)
++RBMPGT = 泡泡龙(欧)
++RBNEG9 = Ben 10 守护地球(美)
++RBNPG9 = Ben 10 守护地球(欧)
++RBNXG9 = Ben 10 守护地球(X)
++RBOE69 = 布吉摇摆(美)
++RBOP69 = 布吉摇摆(欧)
++RBPE4Z = 布伦瑞克职业保龄球(美)
++RBPP4Z = 布伦瑞克职业保龄球(欧)
++RBPPGT = 布伦瑞克职业保龄球(欧)
++RBQENR = 经典英式赛车(美)
++RBQPUG = 经典英式赛车(欧)
++RBRE5G = 轰炸使命[WiFi](美)
++RBRP5G = 轰炸使命[WiFi](欧)
++RBRX5G = 轰炸作业 建造 融化 摧毁(欧)
++RBSJ08 = 战国BASARA2 英雄外传(日)
++RBSJ09 = 战国BASARA2 英雄外传(日)
++RBTE8P = 钓鱼高手(美)
++RBTJ8P = 钓鱼高手(日)
++RBTP8P = 钓鱼高手(欧)
++RBUE08 = 生化危机 安布雷拉历代记(美)
++RBUJ08 = 生化危机 安布雷拉历代记(日)
++RBUK08 = 生化危机 安布雷拉历代记(韩)
++RBUP08 = 生化危机 安布雷拉历代记(欧)
++RBVE52 = 芭比 森林公主(美)
++RBVP52 = 芭比 森林公主(欧)
++RBWE01 = 军队战争2[WiFi](美)
++RBWJ01 = 军队战争2[WiFi](日)
++RBWP01 = 军队战争2[WiFi](欧)
++RBXJ8P = BLEACH死神 对决十刃[WiFi](日)
++RBYE78 = 疯狂农庄(美)
++RBYJ78 = 疯狂农庄(日)
++RBYP78 = 疯狂农庄(欧)
++RBZE5Z = 巫师比利 火箭扫帚大竞速(美)
++RBZP5Z = 巫师比利 火箭扫帚大竞速(欧)
++RBZPUG = 巫师比利 火箭扫帚大竞速(欧)
++RBZXUG = 巫师比利 火箭扫帚大竞速(X)
++RC2E78 = 汽车总动员 全国汽车大赛(美)
++RC2P78 = 汽车总动员 全国汽车大赛(欧)
++RC2X78 = 汽车总动员 全国汽车大赛(X)
++RC2Y78 = 汽车总动员 全国汽车大赛(Y)
++RC3E41 = 模拟宠物猫2(美)
++RC3J41 = 模拟宠物猫2(日)
++RC3P41 = 模拟宠物猫2(欧)
++RC3X41 = 模拟宠物猫2(X)
++RC4JD9 = 蜡笔小新 最强家族春日部之王(日)
++RC4SGT = 蜡笔小新 最强家族春日部之王(西)
++RC5JDQ = 扫除战队(日)
++RC7E20 = 与海怪同行 史前探险(美)
++RC7P7J = 与海怪同行 史前探险(欧)
++RC8E7D = 古惑狼 变异心灵(美)
++RC8P7D = 古惑狼 变异心灵(欧)
++RC8X7D = 古惑狼 变异心灵(X)
++RC9PGN = 人偶CID(欧)
++RCAE78 = 汽车总动员(美)
++RCAJ78 = 汽车总动员(日)
++RCAP78 = 汽车总动员(欧)
++RCAX78 = 汽车总动员(X)
++RCAY78 = 汽车总动员(Y)
++RCBE52 = 坎贝拉猎人(美)
++RCBP52 = 坎贝拉猎人(欧)
++RCCE5G = 料理妈妈(美)
++RCCJC0 = 料理妈妈(日)
++RCCPGT = 料理妈妈(欧)
++RCDD52 = 使命召唤3(德)
++RCDE52 = 使命召唤3(美)
++RCDP52 = 使命召唤3(欧)
++RCDX52 = 使命召唤3(X)
++RCEE5Z = 迷你模型赛车(美)
++RCEPUG = 迷你模型赛车(欧)
++RCEXUG = 迷你模型赛车(X)
++RCFE41 = 宇宙家庭(美)
++RCFP41 = 宇宙家庭(欧)
++RCGE54 = 游戏狂欢节 迷你高尔夫(美)
++RCGP54 = 游戏狂欢节 迷你高尔夫(欧)
++RCHEAF = 大家的啦啦队(美)
++RCHJAF = 大家的啦啦队(日)
++RCHPAF = 大家的啦啦队(欧)
++RCHPGT = 大家的啦啦队(欧)
++RCIE41 = 犯罪现场调查 铁证如山(美)
++RCIP41 = 犯罪现场调查 铁证如山(欧)
++RCJE8P = 管道[WiFi](美)
++RCJP8P = 管道[WiFi](欧)
++RCKPGN = 阿伦·汉森的运动挑战(欧)
++RCLE4Q = 四眼天鸡之动作天王(美)
++RCLP4Q = 四眼天鸡之动作天王(欧)
++RCOJ99 = 名侦探柯南 追忆的幻想(日)
++RCOPNP = 名侦探柯南 追忆的幻想(欧)
++RCPE18 = 穿越迷路(美)
++RCPJ18 = 穿越迷路(日)
++RCPP18 = 穿越迷路(欧)
++RCQEDA = Q版赛车 Wii(美)
++RCQJDA = Q版赛车 Wii(日)
++RCRE5D = 劲速狂飙(美)
++RCRP5D = 劲速狂飙(欧)
++RCSE20 = 射鸡英雄传(美)
++RCSP20 = 射鸡英雄传(欧)
++RCSP7J = 射鸡英雄传(欧)
++RCTE5Z = 反击力量(美)
++RCTP5Z = 反击力量(欧)
++RCTPGT = 反击力量(欧)
++RCUE52 = 卡贝拉传奇冒险(美)
++RCUP52 = 卡贝拉传奇冒险(欧)
++RCVE41 = 孤岛惊魂 复仇(美)
++RCVP41 = 孤岛惊魂 复仇(欧)
++RCXE78 = 全明星拉拉队[平衡板](美)
++RCXP78 = 全明星拉拉队[平衡板](欧)
++RCYPGN = 切格的聚会迷题(欧)
++RD2E41 = 赤铁2[MP](美)
++RD2P41 = 赤钢铁2(欧)
++RD2X41 = 赤铁2[MP](X)
++RD4EA4 = 劲舞革命 劲爆舞会2[跳舞毯](美)
++RD4JA4 = 劲舞革命 劲爆舞会2[跳舞毯](日)
++RD4PA4 = 劲舞革命 劲爆舞会2[跳舞毯](欧)
++RD6EE9 = 动物王国 野生动物探索(美)
++RD6J8N = 动物奇想天外！在谜之乐园摄影(日)
++RD6PNP = 动物奇想天外！在谜之乐园摄影(欧)
++RD8E52 = 与星共舞[跳舞毯](美)
++RD9J18 = 解谜系列Vol.1 数独(日)
++RDAE52 = 与星共舞 一起跳[跳舞毯](美)
++RDBE70 = 龙珠Z 电光火石 2(美)
++RDBJAF = 龙珠Z 电光火石 2(日)
++RDBP70 = 龙珠Z 电光火石 2(欧)
++RDBPAF = 龙珠Z 电光火石 2(欧)
++RDCE78 = 致命生物(美)
++RDCP78 = 致命生物(欧)
++RDDEA4 = 热舞革命 劲爆舞会[跳舞毯](美)
++RDDJA4 = 热舞革命 劲爆舞会[跳舞毯](日)
++RDDPA4 = 热舞革命 劲爆舞会[跳舞毯](欧)
++RDEJ0A = 全日本货柜车祭典(日)
++RDFE41 = 肖恩怀特滑雪板[平衡板](美)
++RDFP41 = 肖恩怀特滑雪板[平衡板](欧)
++RDGEA4 = 恶魔城 审判[WiFi](美)
++RDGJA4 = 恶魔城 审判[WiFi](日)
++RDGPA4 = 恶魔城 审判[WiFi](欧)
++RDHE78 = 毁灭全人类 解放威廉(美)
++RDHP78 = 毁灭全人类 解放威廉(欧)
++RDIE41 = 宠物狗乐园(美)
++RDIJG2 = 宠物狗乐园(日)
++RDIP41 = 宠物狗乐园(欧)
++RDJE4F = 小死神 邪恶的根源(美)
++RDJP4F = 小死神 邪恶的根源(欧)
++RDKE01 = 大金刚 木桶喷射(美)
++RDKJ01 = 大金刚 木桶喷射(日)
++RDKP01 = 大金刚 木桶喷射(欧)
++RDLE5G = 狐狸侦探智救人质(美)
++RDLP70 = 狐狸侦探智救人质(欧)
++RDME6K = 米侬向前冲(美)
++RDMJ8N = 米侬向前冲(日)
++RDMPHZ = 每日英雄 米侬(欧)
++RDNEA4 = 劲舞革命 开心迪士尼[跳舞毯](美)
++RDOE41 = 模拟宠物狗2(美)
++RDOJ41 = 模拟宠物狗2(日)
++RDOP41 = 模拟宠物狗2(欧)
++RDOX41 = 模拟宠物狗2(X)
++RDPE54 = 探险家多拉 拯救雪公主(美)
++RDPP54 = 探险家多拉 拯救雪公主(欧)
++RDPX54 = 探险家多拉 拯救雪公主(X)
++RDQEGD = 勇者斗恶龙 假面女王(美)
++RDQJGD = 勇者斗恶龙 假面女王(日)
++RDQPGD = 勇者斗恶龙 假面女王(欧)
++RDREA4 = 水精迪依大冒险(美)
++RDRJA4 = 水精迪依大冒险(日)
++RDRPA4 = 水精迪依大冒险(欧)
++RDSA-- = 龙珠Z 电光火石 3[WiFi](A)
++RDSE70 = 龙珠Z 电光火石 3[WiFi](美)
++RDSJAF = 龙珠Z 电光火石 3[WiFi](日)
++RDSPAF = 龙珠Z 电光火石 3[WiFi](欧)
++RDTEAF = 电子鸡宠物店(美)
++RDTJAF = 电子鸡宠物店(日)
++RDTPAF = 电子鸡宠物店(欧)
++RDUJDQ = 陆官编年史左手骰子右手剑[WiFi](日)
++RDVE41 = 横冲直撞之平行线(美)
++RDVP41 = 横冲直撞之平行线(欧)
++RDWEG9 = 龙刃 怒火燃烧(美)
++RDWJG9 = 龙刃 怒火燃烧(日)
++RDWPG9 = 龙刃 怒火燃烧(欧)
++RDXE18 = 德卡运动会(美)
++RDXJ18 = 德卡运动会(日)
++RDXKA4 = 德卡运动会(韩)
++RDXP18 = 德卡运动会(欧)
++RDYEGN = 人偶CID(美)
++RDZE01 = 天灾 危机之日(美)
++RDZJ01 = 天灾 危机之日(日)
++RDZP01 = 天灾 危机之日(欧)
++RE3ENR = 空战高手 二战英雄(美)
++RE3PNR = 空战高手 二战英雄(欧)
++RE4E08 = 生化危机(美)
++RE4J08 = 生化危机(日)
++RE4P08 = 生化危机(欧)
++RE5PAF = 大胃王(欧)
++RE7PNK = 狩猎挑战(欧)
++RE8J99 = 家庭教师 禁断的暗之三角[WiFi](日)
++REAE69 = 名人体育(美)
++REAF69 = 名人体育(法)
++REAP69 = 名人体育(欧)
++REBPMT = 憨豆先生的古怪世界(欧)
++RECE6K = 间谍游戏 电梯任务(美)
++RECP6K = 间谍游戏 电梯任务(欧)
++REDA41 = 赤铁(A)
++REDE41 = 赤铁(美)
++REDJ41 = 赤铁(日)
++REDP41 = 赤铁(欧)
++REFP41 = 我的法语教练(欧)
++REGE36 = 紧急出动(美)
++REGP36 = 紧急出动(欧)
++REHE41 = 紧急英雄(美)
++REHP41 = 紧急英雄(欧)
++REJEAF = 活力生活 极限挑战(美)
++REJJAF = 家庭教练2[跳舞毯](日)
++REJPAF = 活力生活 极限挑战[跳舞毯](欧)
++REKE41 = 金牌吉姆卡迪欧塑身[平衡板](美)
++REKJ2N = 有氧拳击 Wii快乐瘦身[平衡板](日)
++REKP41 = 金牌吉姆卡迪欧塑身[平衡板](欧)
++REKU41 = 我的健康教练 金牌吉姆卡迪欧塑身[平衡板](英)
++RELEA4 = 能源小精灵(美)
++RELJA4 = 能源小精灵(日)
++RELKA4 = 能源小精灵(韩)
++RELPA4 = 能源小精灵(欧)
++REMJ8P = 哆啦A梦Wii 秘密道具王决定战！(日)
++RENE8P = 索尼克与黑暗骑士[WiFi](美)
++RENJ8P = 索尼克与黑暗骑士[WiFi](日)
++RENP8P = 索尼克与黑暗骑士[WiFi](欧)
++REQE54 = 徒步旅行抢救队(美)
++REQP54 = 徒步旅行抢救队(欧)
++REQX54 = 徒步旅行抢救队(X)
++REQY54 = 野生动物救援队(Y)
++RESE41 = 我的西班牙语教练(美)
++RESP41 = 我的西班牙语教练(欧)
++RETJAF = 庙会达人(日)
++REUPNK = 我的形体教练(欧)
++REVJ8P = 忌火起草 解明篇(日)
++REVJBP = 忌火起草 解明篇(日)
++REWFMR = 我的马匹俱乐部(法)
++REWXMR = 我的马匹俱乐部(X)
++REWYMR = 我的马匹俱乐部(Y)
++REXE01 = 疯狂卡车(美)
++REXJ01 = 疯狂卡车(日)
++REXP01 = 疯狂卡车(欧)
++REYE4Q = 迪士尼 想唱就唱 歌舞青春3毕业季(美)
++REYP4Q = 迪士尼 想唱就唱 歌舞青春3毕业季(欧)
++REZEJJ = 西洋棋高手(美)
++REZPKM = 西洋棋高手(欧)
++RF2E54 = 神奇四侠 神奇四侠与银影侠(美)
++RF2P54 = 神奇四侠 神奇四侠与银影侠(欧)
++RF3E52 = 法拉利挑战赛(美)
++RF3P6M = 法拉利挑战赛(欧)
++RF4P6M = 超级水果瀑布(欧)
++RF7J08 = 龙之子对卡普空(日)
++RF8E69 = FIFA足球08[WiFi](美)
++RF8J13 = FIFA足球08[WiFi](日)
++RF8K69 = FIFA足球08[WiFi](韩)
++RF8P69 = FIFA足球08[WiFi](欧)
++RF8X69 = FIFA足球08[WiFi](X)
++RF8Y69 = FIFA足球08[WiFi](Y)
++RF9E69 = FIFA足球09[WiFi](美)
++RF9J13 = FIFA足球09[WiFi](日)
++RF9K69 = FIFA足球09[WiFi](韩)
++RF9P69 = FIFA足球09[WiFi](欧)
++RF9X69 = FIFA足球09[WiFi](X)
++RF9Y69 = FIFA足球09[WiFi](Y)
++RFAEAF = 生命运动 户外挑战[跳舞毯](美)
++RFAJAF = 家庭教练 体育世界(日)
++RFAPAF = 家庭教练[跳舞毯](欧)
++RFBE01 = 永恒蔚蓝[WiFi](美)
++RFBJ01 = 永恒蔚蓝[WiFi](日)
++RFBP01 = 永恒蔚蓝[WiFi](欧)
++RFCEGD = 最终幻想水晶编年史 水晶守护者(美)
++RFCJGD = 最终幻想水晶编年史 水晶守护者(日)
++RFCPGD = 最终幻想水晶编年史 水晶守护者(欧)
++RFEE01 = 火炎纹章 晓之女神(美)
++RFEJ01 = 火炎纹章 晓之女神(日)
++RFEP01 = 火炎纹章 晓之女神(欧)
++RFFEGD = 水晶编年史 时之回声[WiFi](美)
++RFFJGD = 水晶编年史 时之回声[WiFi](日)
++RFFPGD = 水晶编年史 时之回声[WiFi](欧)
++RFJJAF = 家庭赛马(日)
++RFKE41 = 我的健康教练(美)
++RFKJ41 = 我的健康教练(日)
++RFKP41 = 我的健康教练(欧)
++RFKX41 = 我的健康教练(X)
++RFLE69 = 美式橄榄球大联盟09[WiFi](美)
++RFLP69 = 美式橄榄球大联盟09[WiFi](欧)
++RFLPWK = 美式橄榄球大联盟09[WiFi](欧)
++RFMJAF = 职棒家庭棒球场[WiFi](日)
++RFNE01 = Wii健身[平衡板](美)
++RFNJ01 = Wii健身[平衡板](日)
++RFNK01 = Wii健身[平衡板](韩)
++RFNP01 = Wii健身[平衡板](欧)
++RFNW01 = Wii健身[平衡板](中)
++RFOE52 = 蜘蛛侠 敌友难辨(美)
++RFOP52 = 蜘蛛侠 敌友难辨(欧)
++RFOX52 = 蜘蛛侠 敌友难辨(X)
++RFPE01 = Wii健身加强版[平衡板](美)
++RFPJ01 = Wii健身加强版[平衡板](日)
++RFPP01 = Wii健身加强版[平衡板](欧)
++RFPR01 = Wii健身加强版[平衡板](俄)
++RFPW01 = Wii健身加强版[平衡板](中)
++RFQE69 = 破相拳击(美)
++RFQJ13 = 破相拳击(日)
++RFQJ69 = 破相拳击(日)
++RFQK69 = 破相拳击(韩)
++RFQP69 = 破相拳击(欧)
++RFRE5G = 摇摆回转公园(美)
++RFRJC0 = 摇摆回转公园(日)
++RFSEEB = 风尘英雄(美)
++RFSJ8P = 迷宫 风尘英雄3机关屋沉睡公主(日)
++RFTE70 = 后院橄榄球(美)
++RFTP70 = 后院橄榄球(欧)
++RFUJA4 = 麻将格斗俱乐部Wii[WiFi](日)
++RFVE52 = 淘气小猴 聚会时间(美)
++RFVP52 = 淘气小猴 聚会时间(欧)
++RFWE5Z = 野外探险 非洲(美)
++RFWPNK = 非洲徒步大冒险(欧)
++RFYFMR = 博涯堡垒 开战(法)
++RFZE41 = 想象 时尚聚会[平衡板](美)
++RFZP41 = 想象 时尚偶像[平衡板](欧)
++RG2EXS = 罪恶装备XX(美)
++RG2JJF = 罪恶装备XX(日)
++RG2PGT = 罪恶装备XX(欧)
++RG2PXS = 罪恶装备XX(欧)
++RG4JC0 = 电车Go！新干线EX 山阳新干线(日)
++RG5EWR = 吉尼斯世界纪录 电视游戏[WiFi](美)
++RG5PWR = 吉尼斯世界纪录 电视游戏[WiFi](欧)
++RG6E69 = 摇滚乐超级明星(美)
++RG6P69 = 摇滚乐超级明星(欧)
++RG8E41 = 宠物体育 狗狗竞技场(美)
++RG8P41 = 宠物体育 狗狗竞技场(欧)
++RG9E54 = 嘉年华游戏 迷你高尔夫(美)
++RG9P54 = 嘉年华游戏 迷你高尔夫(欧)
++RGAE8P = 51号星球(美)
++RGAP8P = 51号星球(欧)
++RGBE08 = 哈维博德曼 律师(美)
++RGBP08 = 哈维博德曼 律师(欧)
++RGCEXS = 遥控直升机Wii 飞行大冒险(美)
++RGCJJF = 遥控直升机Wii 飞行大冒险(日)
++RGCPGT = 遥控直升机Wii 飞行大冒险(欧)
++RGCS52 = 自制 吉他英雄3 下载版(西)
++RGDEA4 = 恐怖行动(美)
++RGDPA4 = 恐怖行动(欧)
++RGEJJ9 = 世界黄金蛋节奏合拍系日本的音符(日)
++RGFE69 = 教父 黑手党(美)
++RGFF69 = 教父 黑手党(法)
++RGFI69 = 教父 黑手党(意)
++RGFP69 = 教父 黑手党(欧)
++RGFS69 = 教父 黑手党(西)
++RGGJAF = GeGeGe的鬼太郎 妖怪大运动会(日)
++RGHC20 = 自制 吉他英雄3 下载版(欧)
++RGHE52 = 吉他英雄3 摇滚传奇[WiFi](美)
++RGHE61 = 自制 吉他英雄3 下载版(美)
++RGHE62 = 自制 吉他英雄3 下载版(美)
++RGHEMR = 自制 吉他英雄3 下载版(美)
++RGHJ52 = 吉他英雄3 摇滚传奇[WiFi](日)
++RGHK52 = 吉他英雄3 摇滚传奇[WiFi](韩)
++RGHP52 = 吉他英雄3 摇滚传奇[WiFi](欧)
++RGHPOH = 自制 唱吧 下载版(欧)
++RGHPS2 = 自制 吉他英雄3 下载版(欧)
++RGIJC8 = G1骑师Wii 2008[平衡板](日)
++RGIPC8 = G1骑师Wii 2008[平衡板](欧)
++RGJE4Z = 森林泰山 探秘(美)
++RGJP7U = 森林泰山 探秘(欧)
++RGKENR = 国际儿童 疯狂高尔夫(美)
++RGKPNR = 国际儿童 疯狂高尔夫(欧)
++RGLE7D = 几何战争 银河[WiFi](美)
++RGLP7D = 几何战争 银河[WiFi](欧)
++RGME5D = 企鹅也疯狂(美)
++RGMP5D = 企鹅也疯狂(欧)
++RGNJAF = 银魂(日)
++RGOJJ9 = 金蛋世界(日)
++RGPJAF = 机动战士高达2 哀.战士篇(日)
++RGQE70 = 捉鬼敢死队(美)
++RGQP70 = 捉鬼敢死队(欧)
++RGSE8P = 幽灵小队[WiFi](美)
++RGSJ8P = 幽灵小队[WiFi](日)
++RGSP8P = 幽灵小队[WiFi](欧)
++RGTE41 = GT职业赛车(美)
++RGTJBL = GT职业赛车(日)
++RGTP41 = GT职业赛车(欧)
++RGVE52 = 吉他英雄 空中铁匠乐队专辑[WiFi](美)
++RGVJ52 = 吉他英雄 空中铁匠乐队专辑[WiFi](日)
++RGVP52 = 吉他英雄 空中铁匠乐队专辑[WiFi](欧)
++RGWE41 = 疯狂兔子 回家[WiFi](美)
++RGWJ41 = 疯狂兔子 回家[WiFi](日)
++RGWP41 = 疯狂兔子 回家[WiFi](欧)
++RGWX41 = 疯狂兔子 回家[WiFi](X)
++RGXE5D = 游戏派对(美)
++RGXP5D = 游戏派对(欧)
++RGYE5Z = 美女卡丁车(美)
++RGYPUG = 美女卡丁车(欧)
++RGZE52 = 哥斯拉能量释放(美)
++RGZE70 = 哥斯拉能量释放(美)
++RGZP70 = 哥斯拉能量释放(欧)
++RH2E41 = 地狱厨房(美)
++RH2P41 = 地狱厨房(欧)
++RH3E4Q = 歌舞青春3 毕业舞会(美)
++RH3J4Q = 歌舞青春3 毕业舞会(日)
++RH3P4Q = 歌舞青春3 毕业舞会(欧)
++RH4XUG = 仓鼠英雄(X)
++RH5EVN = 小马生活冒险[WiFi](美)
++RH5PKM = 爱伦怀塔克的小马生活(欧)
++RH6E69 = 哈里波特与混血王子(美)
++RH6P69 = 哈里波特与混血王子(欧)
++RH7J8P = Sammy合集 北斗神拳[WiFi](日)
++RH8E4F = 古墓丽影 地下世界(美)
++RH8JEL = 古墓丽影 地下世界(日)
++RH8P4F = 古墓丽影 地下世界(欧)
++RH8X4F = 古墓丽影 地下世界(X)
++RH9JC8 = 遥远时空4[WiFi](日)
++RHAE01 = Wii第一次接触(美)
++RHAJ01 = Wii第一次接触(日)
++RHAK01 = Wii第一次接触(韩)
++RHAP01 = Wii第一次接触(欧)
++RHAW01 = Wii第一次接触(中)
++RHCE52 = 历史频道 太平洋战争(美)
++RHCP52 = 历史频道 太平洋战争(欧)
++RHD222 = 自制 死亡之屋2(自)
++RHD333 = 自制 死亡之屋3(自)
++RHDE8P = 死亡之屋2+3(美)
++RHDJ8P = 死亡之屋2+3(日)
++RHDP8P = 死亡之屋2+3(欧)
++RHEEJJ = 海因兹沃尔夫教授的重力挑战(美)
++RHEPKM = 海因兹沃尔夫教授的重力挑战(欧)
++RHFE5D = 快乐大脚(美)
++RHFP5D = 快乐大脚(欧)
++RHGP6Z = 特工雨果 柠檬榨汁(欧)
++RHGX6Z = 特工雨果 柠檬榨汁(X)
++RHHJ8J = 凉宫春日的激动(日)
++RHIEXJ = 第一神拳 革命(美)
++RHIJ41 = 第一神拳 革命(日)
++RHIJJ9 = 第一神拳 革命(日)
++RHIP41 = 第一神拳 革命(欧)
++RHJJ13 = 银星桌面游戏(日)
++RHKE18 = 工作狂(美)
++RHKJ18 = 工作狂(日)
++RHKP18 = 工作狂(欧)
++RHLE4Z = 世界锦标纸牌赛(美)
++RHLPGT = 世界锦标纸牌赛(欧)
++RHMEE9 = 牧场物语(美)
++RHMP99 = 牧场物语(欧)
++RHNE70 = 马儿与我(美)
++RHNP70 = 马儿与我(欧)
++RHOE8P = 死亡之屋 过度杀戮(美)
++RHOJ8P = 死亡之屋 过度杀戮(日)
++RHOP8P = 死亡之屋 过度杀戮(欧)
++RHPJ8N = 欺诈流浪记(日)
++RHQE4Q = 汉娜蒙塔娜 聚光灯下的世界巡演(美)
++RHQP4Q = 汉娜蒙塔娜 聚光灯下的世界巡演(欧)
++RHQX4Q = 孟汉娜万众瞩目全球巡演歌唱大赛(欧)
++RHQY4Q = 孟汉娜万众瞩目全球巡演歌唱大赛(Y)
++RHRJ99 = 家庭教师HITMAN！梦之超级战斗！(日)
++RHSE36 = 热导追踪(美)
++RHSP36 = 热导追踪(欧)
++RHSX36 = 热导追踪(X)
++RHSY36 = 热导追踪(Y)
++RHTE54 = 侠盗猎魔2(美)
++RHTP54 = 侠盗猎魔2(欧)
++RHUE20 = 轮滑城市英雄[平衡板](美)
++RHUP20 = 轮滑城市英雄[平衡板](欧)
++RHUP7J = 轮滑城市英雄[平衡板](欧)
++RHVE5Z = 疯狂小鸡传说(美)
++RHVPFR = 疯狂小鸡传说(欧)
++RHWE52 = 热轮竞速(美)
++RHWP52 = 热轮竞速(欧)
++RHXE78 = 乐队大战(美)
++RHXP78 = 乐队大战(欧)
++RHYJAF = 跳跃之门Wii 极限挑战(日)
++RHZE41 = 模拟宠物马2(美)
++RHZP41 = 模拟宠物马2(欧)
++RI1POH = 自制 唱吧 下载版(欧)
++RI2E4Q = 迪斯尼 想唱就唱 高校音乐剧(美)
++RI2P4Q = 迪斯尼 想唱就唱 高校音乐剧(欧)
++RI2POH = 自制 唱吧 下载版(欧)
++RI3E5D = 别惹蚂蚁(美)
++RI3P5D = 别惹蚂蚁(欧)
++RI3POH = 自制 唱吧 下载版(欧)
++RI6ENR = 夏季运动会2 小岛运动会(美)
++RI6P41 = 夏季运动聚会(欧)
++RI7E4Z = 怪物大破坏 创建和战斗(美)
++RI8E41 = 战火兄弟连 双重时间(美)
++RI8P41 = 战火兄弟连 双重时间(欧)
++RI9EGT = 天后女孩 冰上公主[平衡板](美)
++RI9PGT = 天后女孩 冰上公主[平衡板](欧)
++RIAE52 = 冰河世纪3 恐龙的黎明(美)
++RIAI52 = 冰河世纪3 恐龙的黎明(意)
++RIAP52 = 冰河世纪3 恐龙的黎明(欧)
++RIBES5 = 科学小怪蛋(美)
++RIBPKM = 科学小怪蛋(欧)
++RICENR = 美国铁人料理 顶级烹饪法(美)
++RIDE20 = 微笑世界岛屿挑战(美)
++RIDP7J = 微笑的世界岛屿挑战(欧)
++RIEEA4 = 卡拉OK革命 美国偶像 再次演唱(美)
++RIEPA4 = 卡拉OK革命 美国偶像 再次演唱(欧)
++RIFEA4 = 卡拉OK革命 美国偶像 再次演唱2(美)
++RIGE54 = 徒步旅行救助队 恐龙大拯救(美)
++RIGP54 = 徒步旅行救助队 恐龙大拯救(欧)
++RIHE8P = 无敌绿巨人(美)
++RIHP8P = 无敌绿巨人(欧)
++RIIPNG = 卡丁赛车手(欧)
++RIJE69 = 特种部队 眼镜蛇危机(美)
++RIJP69 = 特种部队 眼镜蛇危机(欧)
++RIKPNG = 卡车赛车手(欧)
++RILJ18 = PUZ系列2 插画逻辑+色彩逻辑(日)
++RIME36 = 碟中谍(美)
++RIMP6M = 碟中谍(欧)
++RINE08 = 丧尸围城 僵尸的祭品(美)
++RINJ08 = 丧尸围城 僵尸的祭品(日)
++RINP08 = 丧尸围城 僵尸的祭品(欧)
++RIOPSU = 恐怖历史之残忍罗马(欧)
++RIPEAF = 海贼王 终极冒险(美)
++RIPJAF = 海贼王 终极冒险(日)
++RIPPAF = 海贼王 终极冒险(欧)
++RIQPUJ = 冰上炫舞(欧)
++RIRE8P = 钢铁侠(美)
++RIRP8P = 钢铁侠(欧)
++RITFMR = 城市之间[平衡板](法)
++RIUJAF = 海贼王 无尽冒险EP2 勇者的觉醒(日)
++RIUPAF = 海贼王 无尽冒险EP2 勇者的觉醒(欧)
++RIWENR = 汉堡岛(美)
++RIXE20 = 道奇赛车 掌控者与挑战者(美)
++RIYE52 = 太空营地(美)
++RIYP52 = 太空营地(欧)
++RIZENR = 印第500赛车(美)
++RJ2E52 = 詹姆斯邦德007 量子危机[WiFi](美)
++RJ2JGD = 詹姆斯邦德007 量子危机[WiFi](日)
++RJ2P52 = 詹姆斯邦德007 量子危机[WiFi](欧)
++RJ3E20 = 吉普越野赛车(美)
++RJ3P7J = 吉普越野赛车(欧)
++RJ4ENR = 珠宝大师 罗马发源地(美)
++RJ4PRM = 珠宝大师 罗马发源地(欧)
++RJ7FWP = 电视7游戏 法语填字游戏(法)
++RJ8E64 = 印第安纳琼斯与帝王手杖(美)
++RJ8P64 = 印第安纳琼斯与帝王手杖(欧)
++RJ9FMR = 思考 逻辑训练(法)
++RJ9PFR = 思考 逻辑训练(欧)
++RJ9XML = 思考 逻辑训练(X)
++RJAD52 = 使命召唤 现代战争 反应能力[WiFi](德)
++RJAE52 = 使命召唤 现代战争 反应能力[WiFi](美)
++RJAP52 = 使命召唤 现代战争 反应能力[WiFi](欧)
++RJAX52 = 使命召唤 现代战争 反应能力[WiFi](X)
++RJBJAF = 大怪兽对决 超人力霸王竞技场(日)
++RJCE52 = Baja 1000越野拉力赛(美)
++RJCP52 = Baja 1000越野拉力赛(欧)
++RJDPKM = 我的动物中心(欧)
++RJEE70 = 层层叠世界巡回赛(美)
++RJEP70 = 层层叠世界巡回赛(欧)
++RJFE5G = 吉利安麦克尔健身训练09[平衡板](美)
++RJFP5G = 吉利安麦克尔健身训练09[平衡板](欧)
++RJFPKM = 吉利安麦克尔健身训练09[平衡板](欧)
++RJGJDA = 人生游戏(日)
++RJHE52 = 马达加斯加赛车(美)
++RJHP52 = 马达加斯加赛车(欧)
++RJJE8P = 丛林之旅 动物救援(美)
++RJJP8P = Jambo!野生动物园探险骑兵(欧)
++RJMERS = 移动世界(美)
++RJMPRS = 移动世界(欧)
++RJNE20 = 建道与赛车(美)
++RJOEXJ = 恐怖体感 咒怨(美)
++RJOJJ9 = 恐怖体感 咒怨(日)
++RJOP99 = 恐怖体感 咒怨(欧)
++RJPJA4 = 实况棒球Wii版(日)
++RJQE5G = 睡衣山姆 别怕黑(美)
++RJQP70 = 睡衣山姆 别怕黑(欧)
++RJREA4 = 劲舞革命 劲爆舞会3[跳舞毯][平衡板](美)
++RJRJA4 = 热舞革命 Music Fit[平衡板](日)
++RJSENR = 川崎水上摩托(美)
++RJSPNR = 川崎水上摩托(欧)
++RJSPUG = 川崎水上摩托(欧)
++RJSXUG = 川崎水上摩托(X)
++RJTJ01 = 大家的常识力(日)
++RJVEGN = 狂热医院 紧急病房(美)
++RJVPGN = 狂热医院 紧急病房(欧)
++RJWJEL = 猛犸象与神秘之石(日)
++RJXE5G = 去玩吧伐木工[平衡板](美)
++RJYE5Z = 费兹维泽医生的动物大拯救[平衡板](美)
++RJZP7U = SNK街机经典Vol1(欧)
++RK2EEB = 超执刀 新血[WiFi](美)
++RK2JEB = 超执刀 新血[WiFi](日)
++RK2P01 = 超执刀 新血[WiFi](欧)
++RK4JAF = 结界师 黑芒楼之影(日)
++RK6E18 = 穿越迷路2[平衡板][WiFi](美)
++RK6J18 = 穿越迷路2[平衡板][WiFi](日)
++RK6P18 = 穿越迷路2[平衡板][WiFi](欧)
++RK7J0A = 黄金之绊(日)
++RK8E54 = 美国职业棒球大联盟 2K8(美)
++RK9EA4 = 卡拉OK革命[麦克风](美)
++RK9PA4 = 卡拉OK革命[麦克风](欧)
++RKAE6K = 卡拉斯Wii射击集锦(美)
++RKAJMS = 卡拉斯Wii射击集锦(日)
++RKAK8M = 卡拉斯Wii射击集锦(韩)
++RKAP6K = 卡拉斯Wii射击集锦(欧)
++RKBE41 = 卡波其涂鸦(美)
++RKBP41 = 卡波其涂鸦(欧)
++RKDEEB = 超执刀 再次执刀(美)
++RKDJEB = 超执刀 再次执刀(日)
++RKDJG9 = 超执刀 再次执刀(日)
++RKDP01 = 超执刀 再次执刀(欧)
++RKDPEB = 超执刀 再次执刀(欧)
++RKEENR = 消失的档案(美)
++RKEPGN = 消失的档案(欧)
++RKEPNR = 消失的档案(欧)
++RKFE7U = 格斗之王合辑 大蛇传说(美)
++RKFEH4 = 格斗之王合辑 大蛇传说(美)
++RKFP7U = 格斗之王合辑 大蛇传说(欧)
++RKGEGY = 贝兹娃娃(美)
++RKGPGY = 贝兹娃娃(欧)
++RKHE52 = 功夫熊猫 神龙大侠(美)
++RKHP52 = 功夫熊猫 神龙大侠(欧)
++RKIENR = 国际儿童冰球赛(美)
++RKIPUG = 国际儿童冰球赛(欧)
++RKJJ0Q = 汉字能力检定协会 250万人的汉检(日)
++RKKE6K = 雪女大旋风(美)
++RKLEG9 = 鬼妈妈(美)
++RKLPG9 = 鬼妈妈(欧)
++RKME5D = 真人快打(美)
++RKMP5D = 真人快打(欧)
++RKNJ2N = 汉检Wii 汉字王决定战(日)
++RKOJBL = 懒懒熊 一起来悠闲生活[平衡板](日)
++RKPE52 = 功夫熊猫(美)
++RKPJ52 = 功夫熊猫(日)
++RKPK52 = 功夫熊猫(韩)
++RKPP52 = 功夫熊猫(欧)
++RKPY52 = 功夫熊猫(Y)
++RKQENR = 糖果工厂(美)
++RKSENR = 儿童篮球赛(美)
++RKSPUG = 儿童篮球赛(欧)
++RKTENR = 国际儿童足球赛(美)
++RKTXUG = 国际儿童足球赛(X)
++RKVE54 = 大棒球联盟2(美)
++RKVP54 = 大棒球联盟2(欧)
++RKWJ18 = 拼图小狗 每日一问(日)
++RKXE69 = 摇滚乐团(美)
++RKXP69 = 摇滚乐团(欧)
++RKYE20 = 玩具军人 倒霉战士(美)
++RKYP20 = 玩具军人 倒霉战士(欧)
++RKYP7J = 玩具军人 倒霉战士(欧)
++RKZEA4 = 迷失蔚蓝Wii(美)
++RKZJA4 = 迷失蔚蓝Wii(日)
++RKZPA4 = 迷失蔚蓝Wii(欧)
++RL2E78 = 我的驯马场(美)
++RL2HMR = 我的驯马场(荷)
++RL2PFR = 我的驯马场(欧)
++RL3EMJ = 金字塔祖玛 3(美)
++RL3PMJ = 金字塔祖玛 3(欧)
++RL4E64 = 乐高印第安纳琼斯2 冒险再续(美)
++RL4P64 = 乐高印第安纳琼斯2 冒险再续(欧)
++RL5E52 = 爱卡莉(美)
++RL5P52 = 爱卡莉(欧)
++RL6E69 = 玩具枪大作战2 精英(美)
++RL7E69 = 小小宠物店 朋友(美)
++RL7P69 = 小小宠物店 朋友(欧)
++RL8E54 = 实况职业力量棒球2008(美)
++RL9PHZ = 台球天王(欧)
++RLADMR = 一掷千金(德)
++RLAE20 = 一掷千金(美)
++RLAPMR = 一掷千金(欧)
++RLBEWR = 乐高蝙蝠侠(美)
++RLBPWR = 乐高蝙蝠侠(欧)
++RLCP7J = 爱如鲜花盛开(欧)
++RLDEGY = 龙的传说(美)
++RLDPFK = 龙的传说(欧)
++RLEEFS = 大满贯保龄球2(美)
++RLEPFS = 大满贯保龄球2(欧)
++RLFE64 = 星球大战 复制战纪(美)
++RLFP64 = 星球大战 复制战纪(欧)
++RLGE64 = 乐高星球大战 完整的传奇(美)
++RLGJ52 = 乐高星球大战 完整的传奇(日)
++RLGP64 = 乐高星球大战 完整的传奇(欧)
++RLHE52 = 小联盟世界锦标赛2008(美)
++RLHP52 = 小联盟世界锦标赛2008(欧)
++RLIE64 = 乐高印第安纳琼斯(美)
++RLIP64 = 乐高印第安纳琼斯(欧)
++RLJEHJ = 线条滑雪2(美)
++RLJPKM = 线条滑雪2(欧)
++RLKEGY = 虚幻勇士 追求无限(美)
++RLKPFK = 虚幻勇士 追求无限(欧)
++RLLP70 = 幸运的路克 独闯西部(欧)
++RLMJH4 = 合金弹头精选集(日)
++RLNFMR = 兰达岛生存游戏[平衡板](法)
++RLNHMR = 前进鲁宾逊[平衡板](荷)
++RLNIMR = 前进鲁宾逊[平衡板](意)
++RLNPMR = 前进鲁宾逊[平衡板](欧)
++RLPE69 = 小小宠物店(美)
++RLPP69 = 小小宠物店(欧)
++RLQE52 = 大联盟运动(美)
++RLQP52 = 大联盟运动(欧)
++RLRE4F = 古墓丽影 十周年纪念版(美)
++RLRJEL = 古墓丽影 十周年纪念版(日)
++RLRP4F = 古墓丽影 十周年纪念版(欧)
++RLSE8P = 异形特攻队(美)
++RLSP8P = 异形特攻队(欧)
++RLTENR = 伦敦出租车 高峰时间(美)
++RLTPNR = 伦敦出租车 高峰时间(欧)
++RLTXUG = 伦敦出租车 高峰时间(X)
++RLUE4Q = 闪电狗(美)
++RLUP4Q = 闪电狗(欧)
++RLUX4Q = 闪电狗(X)
++RLUY4Q = 闪电狗(Y)
++RLVE78 = 降世神通最后的空气大师(美)
++RLVP78 = 降世神通最后的空气大师(欧)
++RLWE78 = 料理鼠王(美)
++RLWJ78 = 料理鼠王(日)
++RLWP78 = 料理鼠王(欧)
++RLWW78 = 料理鼠王(W)
++RLWX78 = 料理鼠王(X)
++RLWY78 = 料理鼠王(Y)
++RLWZ78 = 料理鼠王(Z)
++RLXEMJ = 埃及祖玛 法老王的挑战(美)
++RLXP36 = 埃及祖玛 法老王的挑战(欧)
++RLYEWR = 华纳群星总动员 超级兵工厂(美)
++RLYPWR = 华纳群星总动员 超级兵工厂(欧)
++RLZE4Z = 企鹅保卫战(美)
++RLZP4Z = 企鹅保卫战(欧)
++RM2E69 = 荣誉勋章 英雄2[WiFi](美)
++RM2J13 = 荣誉勋章 英雄2[WiFi](日)
++RM2P69 = 荣誉勋章 英雄2[WiFi](欧)
++RM2U69 = 荣誉勋章 英雄2[WiFi](英)
++RM2X69 = 荣誉勋章 英雄2[WiFi](X)
++RM3A01 = 银河战士3 腐蚀(A)
++RM3E01 = 银河战士3 腐蚀(美)
++RM3J01 = 银河战士3 腐蚀(日)
++RM3P01 = 银河战士3 腐蚀(欧)
++RM4E41 = 怪物四驱 世界巡回赛(美)
++RM4J41 = 怪物四驱 世界巡回赛(日)
++RM4P41 = 怪物四驱 世界巡回赛(欧)
++RM5E7D = 木乃伊归来3 龙帝之墓(美)
++RM5P7D = 木乃伊归来3 龙帝之墓(欧)
++RM6EEB = 巴洛克(美)
++RM6P99 = 巴洛克(欧)
++RM7E4F = 怪物实验室[WiFi](美)
++RM7P4F = 怪物实验室[WiFi](欧)
++RM8E01 = 马里奥派对8(美)
++RM8J01 = 马里奥派对8(日)
++RM8K01 = 马里奥派对8(韩)
++RM8P01 = 马里奥派对8(欧)
++RM9EGM = 蘑菇人 孢子大战(美)
++RM9PGM = 蘑菇人 孢子大战(欧)
++RMAE01 = 用Wii玩马里奥网球GC(美)
++RMAJ01 = 用Wii玩马里奥网球GC(日)
++RMAP01 = 用Wii玩马里奥网球GC(欧)
++RMBE01 = 超级马里奥棒球场 家庭棒球(美)
++RMBJ01 = 超级马里奥棒球场 家庭棒球(日)
++RMBP01 = 超级马里奥棒球场 家庭棒球(欧)
++RMCE01 = 马里奥赛车[WiFi](美)
++RMCJ01 = 马里奥赛车[WiFi](日)
++RMCK01 = 马里奥赛车[WiFi](韩)
++RMCP01 = 马里奥赛车[WiFi](欧)
++RMDE69 = 美式橄榄球大联盟07[WiFi](美)
++RMDP69 = 美式橄榄球大联盟07[WiFi](欧)
++RMEJDA = 大联盟Wii投掷(日)
++RMFE68 = AMF保龄球 非同寻常(美)
++RMFP68 = AMF保龄球 非同寻常(欧)
++RMGA01 = 超级马里奥银河(A)
++RMGE01 = 超级马里奥银河(美)
++RMGJ01 = 超级马里奥银河(日)
++RMGK01 = 超级马里奥银河(韩)
++RMGP01 = 超级马里奥银河(欧)
++RMHE08 = 怪物猎人3[WiFi](美)
++RMHJ08 = 怪物猎人3[WiFi](日)
++RMIE20 = 玛戈的单词大脑(美)
++RMIP7J = 玛戈的单词大脑(欧)
++RMJJC8 = 麻将大会(日)
++RMLEH4 = 合金弹头精选集(美)
++RMLJH4 = 合金弹头精选集(日)
++RMLK52 = 合金弹头精选集(韩)
++RMLP7U = 合金弹头精选集(欧)
++RMLPH4 = 合金弹头精选集(欧)
++RMME7U = 水银融化 革命(美)
++RMMJ7U = 水银融化 革命(日)
++RMMP7U = 水银融化 革命(欧)
++RMNDFR = 我的宠物旅店(德)
++RMNHMN = 我的宠物旅店(荷)
++RMNHMR = 我的宠物旅店(荷)
++RMNPFR = 我的宠物旅店(欧)
++RMOE52 = 怪兽大卡车(美)
++RMOP52 = 怪兽大卡车(欧)
++RMPE54 = 职业力量棒球2008(美)
++RMPP54 = 职业力量棒球2008(欧)
++RMQENR = 魔法制造者 末日宝石(美)
++RMQPUG = 魔法制造者 末日宝石(欧)
++RMQXUG = 魔法制造者 末日宝石(X)
++RMRE5Z = 小魔怪魔法马戏团(美)
++RMRPNK = 小魔怪魔法马戏团(欧)
++RMRXNK = 小魔怪魔法马戏团(X)
++RMSE52 = 惊奇漫画 终极联盟2[WiFi](美)
++RMSP52 = 惊奇漫画 终极联盟2([WiFi]欧)
++RMT101 = 银河战士1
++RMT202 = 自制 银河战士2(自)
++RMTJ18 = 桃太郎电铁16北海道大移动[WiFi](日)
++RMUE52 = 漫画英雄联盟(美)
++RMUJ2K = 漫画英雄联盟(日)
++RMUP52 = 漫画英雄联盟(欧)
++RMVE69 = 荣誉勋章 先遣部队(美)
++RMVP69 = 荣誉勋章 先遣部队(欧)
++RMVX69 = 荣誉勋章 先遣部队(X)
++RMWE20 = M&M巧克力卡丁赛车(美)
++RMWP20 = M&M巧克力卡丁赛车(欧)
++RMXE78 = 极限越野 突破[WiFi](美)
++RMXP78 = 极限越野 突破[WiFi](欧)
++RMYE5Z = 超级卡丁车GP(美)
++RMYPUG = 超级卡丁车GP(欧)
++RMYXUG = 超级卡丁车GP(X)
++RMZE5Z = 神话制造者 崔克茜在玩具岛(美)
++RMZPUG = 神话制造者 崔克茜在玩具岛(欧)
++RN2EAF = Namco博物馆重制版(美)
++RN2P70 = Namco博物馆重制版(欧)
++RN3E78 = 海绵宝宝 玩具机器人来袭(美)
++RN3J78 = 海绵宝宝 玩具机器人来袭(日)
++RN3P78 = 海绵宝宝 玩具机器人来袭(欧)
++RN3X78 = 海绵宝宝 玩具机器人来袭(X)
++RN4E41 = 创造新世纪(美)
++RN4P41 = 创造新世纪(欧)
++RN5E78 = 赤裸兄弟乐队(美)
++RN5P78 = 赤裸兄弟乐队(欧)
++RN6ENR = 北美狩猎盛典(美)
++RN6P7J = 北美狩猎盛典(欧)
++RN7E78 = 邻居间的游戏(美)
++RN7P78 = 邻居间的游戏(欧)
++RN8JC8 = 信长的野望·革新 威力加强版(日)
++RN9E4F = 巨虫魔岛(美)
++RN9JEL = 巨虫魔岛(日)
++RN9P4F = 巨虫魔岛(欧)
++RNAE69 = 美国大学橄榄球2009(美)
++RNBE69 = 美国职业篮球2008[WiFi](美)
++RNBP69 = 美国职业篮球2008[WiFi](欧)
++RNBX69 = 美国职业篮球2008[WiFi](X)
++RNCEH4 = SNK街机经典Vol1(美)
++RNCPH4 = SNK街机经典Vol1(欧)
++RNDJAF = 交响情人梦 梦之☆管弦乐(日)
++RNEEDA = 火影忍者疾风传 激斗忍者大战 3[WiFi](美)
++RNEJDA = 火影忍者疾风传 激斗忍者大战EX3(日)
++RNFE69 = 美式橄榄球大联盟08[WiFi](美)
++RNFP69 = 美式橄榄球大联盟08[WiFi](欧)
++RNGJ99 = 魔法老师涅吉!新契约大战(日)
++RNHE41 = 英雄不再(美)
++RNHJ99 = 英雄不再(日)
++RNHK8M = 英雄不再(韩)
++RNHP41 = 英雄不再(欧)
++RNHP99 = 英雄不再(欧)
++RNIPGT = 休养生息 营养调理[平衡板](欧)
++RNJE4F = 迷你忍者(美)
++RNJP4F = 迷你忍者(欧)
++RNKE69 = 玩具枪大战(美)
++RNKP69 = 玩具枪大战(欧)
++RNLE54 = 北美冰球联盟2009(美)
++RNLP54 = 北美冰球联盟2009[WiFi](欧)
++RNME5Z = 面包忍者(美)
++RNMPUG = 面包忍者(欧)
++RNMXUG = 面包忍者(X)
++RNNE4Q = 纳尼亚传奇 凯斯宾王子(美)
++RNNJ4Q = 纳尼亚传奇 凯斯宾王子(日)
++RNNP4Q = 纳尼亚传奇 凯斯宾王子(欧)
++RNNX4Q = 纳尼亚传奇 凯斯宾王子(X)
++RNNY4Q = 纳尼亚传奇 凯斯宾王子(Y)
++RNNZ4Q = 纳尼亚传奇 凯斯宾王子(Z)
++RNOJ01 = 异色代码 R 记忆之门(日)
++RNOP01 = 异色代码 R 记忆之门(欧)
++RNPE69 = 极品飞车 街头职业赛(美)
++RNPJ13 = 极品飞车 街头职业赛(日)
++RNPK69 = 极品飞车 街头职业赛(韩)
++RNPP69 = 极品飞车 街头职业赛(欧)
++RNPX69 = 极品飞车 街头职业赛(X)
++RNPY69 = 极品飞车 街头职业赛(Y)
++RNRE41 = 火爆机车[WiFi](美)
++RNRJ41 = 火爆机车[WiFi](日)
++RNRP41 = 火爆机车[WiFi](欧)
++RNSD69 = 极品飞车10卡本峡谷(德)
++RNSE69 = 极品飞车10卡本峡谷(美)
++RNSF69 = 极品飞车10卡本峡谷(法)
++RNSJ13 = 极品飞车10卡本峡谷(日)
++RNSP69 = 极品飞车10卡本峡谷(欧)
++RNSX69 = 极品飞车10卡本峡谷(X)
++RNUE8P = 南茜朱儿 冰溪白狼(美)
++RNVE5Z = 阿努比斯2(美)
++RNVP5Z = 阿努比斯2(欧)
++RNVPUG = 阿努比斯2(欧)
++RNVXUG = 阿努比斯2(X)
++RNWJAF = NAMCO嘉年华会(日)
++RNWKAF = Namco博物馆重制版(韩)
++RNXEDA = 火影忍者疾风传 激斗忍者大战(美)
++RNXJDA = 火影忍者疾风传 激斗忍者大战(日)
++RNXPDA = 火影忍者疾风传 激斗忍者大战(欧)
++RNYEDA = 火影忍者疾风传 激斗忍者大战 2(美)
++RNYJDA = 火影忍者疾风传 激斗忍者大战 2(日)
++RNYPDA = 火影忍者疾风传 激斗忍者大战 2(欧)
++RNZE69 = 忍者反应[WiFi](美)
++RNZJ13 = 忍者反应(日)
++RNZK69 = 忍者反应(韩)
++RNZP69 = 忍者反应(欧)
++RO2E7N = 福特越野赛车(美)
++RO2P7N = 福特越野赛车(欧)
++RO3EXJ = 小国王物语(美)
++RO3J99 = 小国王物语(日)
++RO3P99 = 小国王物语(欧)
++RO4JDA = 斗真传(日)
++RO5E52 = 无敌风火轮赛车 第五战队(美)
++RO7E7D = 斯派罗传说 永夜(美)
++RO7P7D = 斯派罗传说 永夜(欧)
++RO8E7D = 斯派罗传说 龙之黎明(美)
++RO8P7D = 斯派罗传说 龙之黎明(欧)
++RO8X7D = 斯派罗传说 龙之黎明(X)
++RO9PNK = 水底恐慌(欧)
++ROAE36 = 霸王 黑暗传奇(美)
++ROAP36 = 霸王 黑暗传奇(欧)
++ROBE7U = 暗夜杀机 结果(美)
++ROBPPL = 暗夜杀机 结果(欧)
++ROCE5Z = 小魔怪卡丁车(美)
++ROCPNK = 小魔怪卡丁车(欧)
++RODE01 = 瓦里奥制造 平滑移动(美)
++RODJ01 = 瓦里奥制造 平滑移动(日)
++RODK01 = 瓦里奥制造 平滑移动(韩)
++RODP01 = 瓦里奥制造 平滑移动(欧)
++ROEEJZ = 流浪狗之家(美)
++ROEPGT = 流浪狗之家(欧)
++ROFE5Z = 极限越野特别版(美)
++ROFPUG = 极限越野特别版(欧)
++ROGE78 = 塔克和恶心的监护人(美)
++ROGP78 = 塔克和恶心的监护人(欧)
++ROHJAF = 快乐组舞(日)
++ROJE52 = 拉帕拉 大众钓鱼(美)
++ROJP52 = 惠宝来 大家来钓鱼(欧)
++ROKJ18 = 卡拉OK 欢乐之声Wii(日)
++ROLE8P = 马里奥与索尼克在温哥华冬奥会[WiFi][平衡板](美)
++ROLJ01 = 马里奥与索尼克在温哥华冬奥会[WiFi][平衡板](日)
++ROLK01 = 马里奥与索尼克在温哥华冬奥会[WiFi][平衡板](韩)
++ROLP8P = 马里奥与索尼克在温哥华冬奥会[WiFi][平衡板](欧)
++ROMJ08 = 怪物猎人G[WiFi](日)
++RONEG9 = 御姐玫瑰 革命[WiFi](美)
++RONJG9 = 御姐玫瑰 革命[WiFi](日)
++RONPG9 = 御姐玫瑰 革命[WiFi](欧)
++ROPE41 = 狩猎季节(美)
++ROPP41 = 狩猎季节(欧)
++ROQJEP = 巴洛克(日)
++ROSJ01 = 魔法指挥棒[WiFi](日)
++ROTE20 = 双重打击 雷电行动(美)
++ROTP20 = 双重打击 雷电行动(欧)
++ROTP7J = 双重打击 雷电行动(欧)
++ROUJAF = 海贼王冒险EP1 随波荡漾的秘宝(日)
++ROUPAF = 海贼王冒险EP1 随波荡漾的秘宝(欧)
++ROVE6U = 巡游马戏团[平衡板](美)
++ROWE08 = 大神(美)
++ROWJ08 = 大神(日)
++ROWP08 = 大神(欧)
++ROXE20 = 上菜啦(美)
++ROXP7J = 上菜啦(欧)
++ROXX7J = 上菜啦(X)
++ROYE41 = 美食从天而降(美)
++ROYP41 = 美食从天而降(欧)
++ROYX41 = 美食从天降(X)
++RP2E69 = 冷知识游戏(美)
++RP2P69 = 冷知识游戏(欧)
++RP3JAF = 高尔夫球选手猿(日)
++RP4E69 = 我的模拟聚会[WiFi](美)
++RP4J13 = 我的模拟聚会[WiFi](日)
++RP4P69 = 我的模拟聚会[WiFi](欧)
++RP5JA4 = 实况力量职业棒球15(日)
++RP6E41 = 宠物 疯狂的猴子(美)
++RP6P41 = 宠物 疯狂的猴子(欧)
++RP7E52 = 海盗任务 搜寻黑胡子的密宝(美)
++RP7P52 = 海盗任务 搜寻黑胡子的密宝(欧)
++RP9ERS = 太空黑猩猩(美)
++RP9PRS = 太空黑猩猩(欧)
++RP9XRS = 太空黑猩猩(X)
++RPAF70 = 船桨男孩 迷失(法)
++RPBE01 = 口袋妖怪 战斗革命[WiFi](美)
++RPBJ01 = 口袋妖怪 战斗革命[WiFi](日)
++RPBP01 = 口袋妖怪 战斗革命[WiFi](欧)
++RPCE20 = 难题收藏(美)
++RPCP41 = 难题收藏(欧)
++RPCX7J = 难题收藏(X)
++RPDEGN = PDC世界飞镖锦标赛2008(美)
++RPDPGN = PDC世界飞镖锦标赛2008(欧)
++RPFE52 = 森林寻宝 大冒险(美)
++RPFP52 = 森林寻宝 大冒险(欧)
++RPFU52 = 森林寻宝 大冒险(英)
++RPGE5D = 怪兽大破坏(美)
++RPGP5D = 怪兽大破坏(欧)
++RPHPPN = 粉红猪小妹 游戏(欧)
++RPIE52 = MTV 帮你改装车(美)
++RPIP52 = MTV 帮你改装车(欧)
++RPJJ99 = 弧光幻想曲(日)
++RPKE52 = 世界扑克冠军联赛2007(美)
++RPKP52 = 世界扑克冠军联赛2007(欧)
++RPLE52 = 雷培拉钓鱼巡回赛(美)
++RPLP52 = 雷培拉钓鱼巡回赛(欧)
++RPMJA4 = 实况力量棒球 职业棒球大联盟2(日)
++RPNE78 = 我的宠物旅馆(美)
++RPOEC8 = 欧波娜大冒险(美)
++RPOJC8 = 欧波娜大冒险(日)
++RPOPC8 = 欧波娜大冒险(欧)
++RPPE41 = 波斯王子 宿敌之剑(美)
++RPPP41 = 波斯王子 宿敌之剑(欧)
++RPQES5 = 桌球派对(美)
++RPQPS5 = 桌球派对(欧)
++RPSE4Q = 迪斯尼公主 魔咒下的旅行(美)
++RPSJ4Q = 迪斯尼公主 魔咒下的旅行(日)
++RPSP4Q = 迪斯尼公主 魔咒下的旅行(欧)
++RPTD52 = 爱心宠物狗(德)
++RPTE52 = 爱心宠物狗(美)
++RPTP52 = 爱心宠物狗(欧)
++RPUJ8P = 魔法气泡15周年纪念版(日)
++RPVE4Z = 猫猫物语(美)
++RPVPKM = 猫猫物语(欧)
++RPXE69 = EA游乐场(美)
++RPXJ13 = EA游乐场(日)
++RPXP69 = EA游乐场(欧)
++RPYE9B = 魔法高尔夫(美)
++RPYJ9B = 魔法高尔夫(日)
++RPYP9B = 魔法高尔夫(欧)
++RPZJA4 = 实况力量职业棒球Wii决定版[WiFi](日)
++RQ2JK6 = 疯狂攀登者Wii(日)
++RQ3PGN = PDC世界飞镖锦标赛2009(欧)
++RQ4E78 = 棉球方块历险记(美)
++RQ4J78 = 棉球方块历险记(日)
++RQ4P78 = 棉球方块历险记(欧)
++RQ5E5G = 疯狗麦基利(美)
++RQ5P5G = 疯狗麦基利(欧)
++RQ5X5G = 疯狗麦基利(欧)
++RQ6EJJ = 妖山诅咒(美)
++RQ6PKM = 妖山诅咒(欧)
++RQ6XKM = 妖山诅咒(X)
++RQ8E08 = GP摩托车赛08(美)
++RQ8P08 = GP摩托车赛08(欧)
++RQ9E69 = 美国职业篮球2009[WiFi](美)
++RQ9F69 = 美国职业篮球2009[WiFi](法)
++RQ9P69 = 美国职业篮球2009[WiFi](欧)
++RQ9S69 = 美国职业篮球2009[WiFi](西)
++RQBENR = 川崎4X4沙滩车(美)
++RQBPNR = 川崎4X4沙滩车(欧)
++RQBPUG = 川崎4X4沙滩车(欧)
++RQBXUG = 川崎4X4沙滩车(X)
++RQCEAF = 大胃王(美)
++RQCJAF = 大胃王(日)
++RQEE6U = 阿加莎克里斯蒂 阳光下的罪恶(美)
++RQEP6V = 阿加莎克里斯蒂 阳光下的罪恶(欧)
++RQFE6U = 破箱人 终极难题冒险(美)
++RQFP6V = 破箱人 终极难题冒险(欧)
++RQGE69 = 我的模拟人生 赛车(美)
++RQGJ13 = 我的模拟人生 赛车(日)
++RQGJ69 = 我的模拟人生 赛车(日)
++RQGP69 = 我的模拟人生 赛车(欧)
++RQIJ01 = NHK红白猜谜合战(日)
++RQJE7D = 古惑狼之泰坦巨人[WiFi](美)
++RQJP7D = 古惑狼之泰坦巨人(欧)
++RQJX7D = 古惑狼之泰坦巨人[WiFi](X)
++RQKE41 = 马戏团游戏(美)
++RQKP41 = 聚会游乐园(欧)
++RQLE64 = 星球大战之克隆战争 共和国英雄(美)
++RQLP64 = 星球大战之克隆战争 共和国英雄(欧)
++RQMEVN = 海底指挥官(美)
++RQMPVN = 海底指挥官(欧)
++RQNEWR = 史酷比最初恐惧(美)
++RQNPWR = 史酷比最初恐惧(欧)
++RQOE69 = 孢子英雄(美)
++RQOJ13 = 孢子英雄(日)
++RQOP69 = 孢子英雄(欧)
++RQPE52 = 卡贝拉的猎鹿(美)
++RQPP52 = 卡贝拉的猎鹿(欧)
++RQQE70 = 后院橄榄球2009(美)
++RQREXJ = 空中杀手 无罪王牌(美)
++RQRJAF = 空中杀手 无罪王牌(日)
++RQRPAF = 空中杀手 无罪王牌(欧)
++RQSE4Z = 弹珠台名人堂 威廉收藏版(美)
++RQSP6M = 经典弹珠台(欧)
++RQTE6U = 阿加莎·克里斯蒂 童谣谋杀案(美)
++RQTP6V = 阿加莎·克里斯蒂 童谣谋杀案(欧)
++RQUEFS = 超级小卡车(美)
++RQVE20 = 太平洋解放者(美)
++RQWEG9 = 益智之迷 战神的挑战(美)
++RQWPG9 = 益智之迷 战神的挑战(欧)
++RQXP70 = 奥运会上的阿斯特里克斯(欧)
++RQYENR = 梦幻水族世界(美)
++RQZE41 = 异形4X4特技赛车(美)
++RQZP41 = 怪兽4X4特级赛车(欧)
++RR2ENR = 装载卡车竞赛2(美)
++RR2PNR = 装载卡车竞赛2(欧)
++RR2PUG = 装载卡车竞赛2(欧)
++RR3EA4 = 终极聚会挑战[跳舞毯](美)
++RR3JA4 = 全家挑战(日)
++RR3PA4 = 一起派对(欧)
++RR4EGY = 熊熊工作室(美)
++RR4PFK = 熊熊工作室(欧)
++RR5E70 = 暴力拳击2 革命(美)
++RR5P70 = 暴力拳击2 革命(欧)
++RR7PVP = 一球成名 皇家马德里 游戏版(欧)
++RR8PUJ = 国际田径大赛(欧)
++RR9E78 = 世界职业摔角2009[WiFi](美)
++RRAE5Z = 猫王的摇滚大冒险(美)
++RRAPUG = 猫王的摇滚大冒险(欧)
++RRAXUG = 猫王的摇滚大冒险(X)
++RRBE41 = 雷曼 疯狂兔子(美)
++RRBJ41 = 雷曼 疯狂兔子(日)
++RRBP41 = 雷曼 疯狂兔子(欧)
++RRCE52 = 芭比小马冒险 骑术野营(美)
++RRCP52 = 芭比小马冒险 骑术野营(欧)
++RRDE69 = 摇滚乐团 乐曲扩展包2(美)
++RRDP69 = 摇滚乐团 乐曲扩展包2(欧)
++RREE69 = 摇滚乐团 乐曲扩展包1(美)
++RREP69 = 摇滚乐团 乐曲扩展包1(欧)
++RRFEE9 = 鱼之眼Wii(美)
++RRFPE9 = 鱼之眼Wii(欧)
++RRGE52 = 马达加斯加2 逃往非洲(美)
++RRGP52 = 马达加斯加2 逃往非洲(欧)
++RRHPUJ = 玛丽·金的骑术学校2(欧)
++RRHXUJ = 马术骑师(X)
++RRJFMR = 准备稳妥的厨师(法)
++RRJIMR = 准备稳妥的厨师(意)
++RRJPMR = 准备好的可靠的厨师(欧)
++RRKE70 = 鬼屋魔影(美)
++RRKP70 = 鬼屋魔影(欧)
++RRLE78 = 贝兹娃娃 女孩本摇滚(美)
++RRLP78 = 贝兹娃娃 女孩本摇滚(欧)
++RRLX78 = 贝兹娃娃 女孩本摇滚(X)
++RRLY78 = 贝兹娃娃 女孩本摇滚(Y)
++RRLZ78 = 贝兹娃娃 女孩本摇滚(Z)
++RRME69 = 孩之宝 家庭游戏之夜(美)
++RRMP69 = 孩之宝 家庭游戏之夜(欧)
++RRMX69 = 孩之宝 家庭游戏之夜(X)
++RRPE41 = 正确定价(美)
++RRQE52 = 史莱克的疯狂嘉年华(美)
++RRQP52 = 史莱克的疯狂嘉年华(欧)
++RRQX52 = 史莱克的疯狂嘉年华(X)
++RRRE5Z = 火场英雄 消防队员(美)
++RRRPRM = 火场英雄 消防队员(欧)
++RRSE4Q = 迪斯尼 拜访鲁滨逊一家(美)
++RRSJ4Q = 迪斯尼 拜访鲁滨逊一家(日)
++RRSP4Q = 迪斯尼 拜访鲁滨逊一家(欧)
++RRSX4Q = 迪斯尼 拜访鲁滨逊一家(X)
++RRTE52 = 打击聚会(美)
++RRTP52 = 打击聚会(欧)
++RRUEJF = 冬季运动会2 下一个挑战[平衡板](美)
++RRUFRT = 冬季运动会2009 下一个挑战[平衡板](法)
++RRUJJF = 冬季运动会2009[平衡板](日)
++RRUPRT = 冬季运动会2009[平衡板](欧)
++RRVENR = 战斗愤怒 机器人战争(美)
++RRVPNR = 战斗愤怒 机器人战争(欧)
++RRWJAF = 超级机器人大战NEO(日)
++RRXE5Z = 怪物卡车竞技场(美)
++RRXPUG = 怪物卡车竞技场(欧)
++RRXXUG = 怪物卡车竞技场(X)
++RRYEHG = 侠盗骑兵 石英地带大屠杀(美)
++RRYPHY = 侠盗中队(欧)
++RRZEGY = 魔方世界(美)
++RRZPGY = 魔方世界(欧)
++RS2EGJ = 终极猎鸭(美)
++RS2PGJ = 终极猎鸭(欧)
++RS3E52 = 蜘蛛侠3(美)
++RS3J52 = 蜘蛛侠3(日)
++RS3P52 = 蜘蛛侠3(欧)
++RS3X52 = 蜘蛛侠3(X)
++RS4EXS = 式神之城3(美)
++RS4JJF = 式神之城3(日)
++RS4PXS = 式神之城3(欧)
++RS5EC8 = 战国无双KATANA(美)
++RS5JC8 = 战国无双KATANA(日)
++RS5PC8 = 战国无双KATANA(欧)
++RS7J01 = 光速蒙面侠21 赛场上的最强战士(日)
++RS8J8N = 上海(日)
++RS9E8P = 索尼克滑板 失重[WiFi](美)
++RS9J8P = 索尼克滑板 失重[WiFi](日)
++RS9P8P = 索尼克滑板 失重[WiFi](欧)
++RSAE78 = 海绵宝宝 亚特兰蒂斯(美)
++RSAP78 = 海绵宝宝 亚特兰蒂斯(欧)
++RSBA01 = 任天堂明星大乱斗X[WiFi](A)
++RSBE01 = 任天堂明星大乱斗X[WiFi](美)
++RSBJ01 = 任天堂明星大乱斗X[WiFi](日)
++RSBP01 = 任天堂明星大乱斗X[WiFi](欧)
++RSCD7D = 疤面煞星 掌握世界(德)
++RSCE7D = 疤面煞星 掌握世界(美)
++RSCP7D = 疤面煞星 掌握世界(欧)
++RSCU7D = 疤面煞星 掌握世界(英)
++RSDJAF = SD高达之革命(日)
++RSEJGD = 噬魂者 单调公主(日)
++RSFE7U = 胧村正 妖刀传(美)
++RSFJ99 = 胧村正 妖刀传(日)
++RSFP99 = 胧村正 妖刀传(欧)
++RSHE69 = 我的模拟王国(美)
++RSHJ13 = 我的模拟王国(日)
++RSHK69 = 我的模拟王国(韩)
++RSHP69 = 我的模拟王国(欧)
++RSIE69 = 我的模拟人生(美)
++RSIJ13 = 我的模拟人生(日)
++RSIP69 = 我的模拟人生(欧)
++RSJE41 = 断剑 圣堂武士之谜(美)
++RSJP41 = 断剑 圣堂武士之谜(欧)
++RSKE52 = 怪物史莱克3(美)
++RSKP52 = 怪物史莱克3(欧)
++RSKX52 = 怪物史莱克3(X)
++RSLEAF = 剑魂传说(美)
++RSLJAF = 剑魂传说(日)
++RSLKAF = 剑魂传说(韩)
++RSLPAF = 剑魂传说(欧)
++RSME8P = 超级猴子球 香蕉闪电战(美)
++RSMJ8P = 超级猴子球 香蕉闪电战(日)
++RSMP8P = 超级猴子球 香蕉闪电战(欧)
++RSND69 = 辛普森一家(德)
++RSNE69 = 辛普森一家(美)
++RSNF69 = 辛普森一家(法)
++RSNP69 = 辛普森一家(欧)
++RSNX69 = 辛普森一家(X)
++RSOE4Z = 纸牌麻将游戏专辑(美)
++RSOP4Z = 纸牌麻将游戏专辑(欧)
++RSPE01 = Wii运动(美)
++RSPJ01 = Wii运动(日)
++RSPK01 = Wii运动(韩)
++RSPP01 = Wii运动(欧)
++RSPW01 = Wii运动(中)
++RSQEAF = 家庭滑雪[平衡板](美)
++RSQJAF = 家庭滑雪[平衡板](日)
++RSQPAF = 家庭滑雪[平衡板](欧)
++RSRE8P = 索尼克与神秘指环(美)
++RSRJ8P = 索尼克与神秘指环(日)
++RSRP8P = 索尼克与神秘指环(欧)
++RSSEH4 = 侍魂 六番胜负(美)
++RSSJH4 = 侍魂 六番胜负(日)
++RSSK52 = 侍魂 六番胜负(韩)
++RSSP7U = 侍魂 六番胜负(欧)
++RSTE64 = 星球大战 原力释放(美)
++RSTJ52 = 星球大战 原力释放(日)
++RSTP64 = 星球大战 原力释放(欧)
++RSUENR = 夏季运动会 天堂岛(美)
++RSUP41 = 夏季运动会 天堂岛(欧)
++RSVE8P = 索尼克 释放(美)
++RSVJ8P = 索尼克 释放(日)
++RSVP8P = 索尼克 释放(欧)
++RSWE08 = 生化间谍(美)
++RSWP08 = 生化间谍(欧)
++RSXE69 = 极限滑雪(美)
++RSXJ13 = 极限滑雪(日)
++RSXK69 = 极限滑雪(韩)
++RSXP69 = 极限滑雪(欧)
++RSYE20 = 冠军拳击赛(美)
++RSYP7J = 冠军拳击赛(欧)
++RSZJES = 雪女大旋风纱雪小雪的惊奇大骚动(日)
++RSZPGT = 雪女大旋风纱雪小雪的惊奇大骚动(欧)
++RT2E20 = 极地熊宝贝(美)
++RT2P20 = 极地熊宝贝(欧)
++RT2P7J = 极地熊宝贝(欧)
++RT3E54 = Rockstar乒乓球(美)
++RT3JEL = Rockstar乒乓球(日)
++RT3P54 = Rockstar乒乓球(欧)
++RT4EAF = 仙乐传说 拉塔托斯克的骑士(美)
++RT4JAF = 仙乐传说 拉塔托斯克的骑士(日)
++RT4PAF = 仙乐传说 拉塔托斯克的骑士(欧)
++RT5E8P = 世嘉超级明星网球(美)
++RT5P8P = 世嘉超级明星网球(欧)
++RT6FKM = 神奇的旋转木马(法)
++RT6PKM = 神奇的旋转木马(欧)
++RT7E69 = 泰格伍兹高尔夫巡回07(美)
++RT7F69 = 泰格伍兹高尔夫巡回07(法)
++RT7P69 = 泰格伍兹高尔夫巡回07(欧)
++RT8E69 = 泰格伍兹高尔夫巡回08(美)
++RT8J13 = 泰格伍兹高尔夫巡回08(日)
++RT8K69 = 泰格伍兹高尔夫巡回08(韩)
++RT8P69 = 泰格伍兹高尔夫巡回08(欧)
++RT9E52 = 托尼霍克滑板 练习场[WiFi](美)
++RT9P52 = 托尼霍克滑板 练习场[WiFi](欧)
++RTBE52 = 职业钓鱼(美)
++RTBP52 = 职业钓鱼(欧)
++RTCE41 = 分裂细胞 双重间谍(美)
++RTCP41 = 分裂细胞 双重间谍(欧)
++RTDE6K = 新.中华大仙 米迦勒与美美的冒险(美)
++RTDJES = 新.中华大仙 米迦勒与美美的冒险(日)
++RTDK8M = 新.中华大仙 米迦勒与美美的冒险(韩)
++RTEE78 = 我的宠物医院(美)
++RTEHMR = 我的宠物医院(荷)
++RTEPFR = 我的宠物医院(欧)
++RTFE52 = 变形金刚 游戏(美)
++RTFJ52 = 变形金刚 游戏(日)
++RTFK52 = 变形金刚 游戏(韩)
++RTFP52 = 变形金刚 游戏(欧)
++RTFX52 = 变形金刚 游戏(X)
++RTFY52 = 变形金刚 游戏(Y)
++RTGJ18 = Wi-Fi对应 严选桌面游戏[WiFi](日)
++RTHE52 = 托尼霍克滑板(美)
++RTHP52 = 托尼霍克滑板(欧)
++RTIE8P = 古怪运动世界(美)
++RTIJ8P = 疯狂世界大运动(日)
++RTIP8P = 古怪运动世界(欧)
++RTJE68 = 星舰迷航记 征服(美)
++RTJP68 = 星舰迷航记 征服(欧)
++RTKE5Z = 章鱼大作战[WiFi](美)
++RTKJDQ = 章鱼大作战[WiFi](日)
++RTKK8M = 章鱼大作战[WiFi](韩)
++RTLE18 = 目标！钓鱼大师 世界版(美)
++RTLJ18 = 目标！钓鱼大师 世界版(日)
++RTLP18 = 目标！钓鱼大师 世界版(欧)
++RTME41 = 忍者神龟2007旋风再起(美)
++RTMP41 = 忍者神龟2007旋风再起(欧)
++RTNE41 = 天诛4(美)
++RTNJCQ = 天诛4(日)
++RTNP41 = 天诛4(欧)
++RTOJ8P = 428 被封锁的涉谷(日)
++RTQENR = 怪物卡车 越野赛(美)
++RTQPUG = 怪物卡车 越野赛(欧)
++RTQXUG = 怪物卡车 越野赛(X)
++RTRE18 = 垂钓大师(美)
++RTRJ18 = 垂钓大师(日)
++RTRP18 = 垂钓大师(欧)
++RTSEVN = 特工少女组 狂欢派对(美)
++RTSP41 = 特工少女组 狂欢派对(欧)
++RTTJAF = 电子鸡宠物店(日)
++RTUEKM = 秘密档案 通古斯(美)
++RTUFKM = 秘密档案 通古斯(法)
++RTUPKM = 秘密档案 通古斯(欧)
++RTVE64 = 主题公园 惊奇世界(美)
++RTVP64 = 主题公园 惊奇世界(欧)
++RTWE5D = 摔角联盟(美)
++RTWP5D = 摔角联盟(欧)
++RTYP01 = Wii国际象棋[WiFi](欧)
++RTZE08 = 宝岛Z 巴尔巴罗斯的秘宝(美)
++RTZJ08 = 宝岛Z 巴尔巴罗斯的秘宝(日)
++RTZK08 = 宝岛Z 巴尔巴罗斯的秘宝(韩)
++RTZP08 = 宝岛Z 巴尔巴罗斯的秘宝(欧)
++RU1P4Q = 自制 迪斯尼想唱就唱 下载版(欧)
++RU2E5Z = 冬季运动会2 下一个挑战[平衡板](美)
++RU2P4Q = 自制 迪斯尼想唱就唱 下载版(欧)
++RU2P5Z = 冬季运动会2 下一个挑战[平衡板](欧)
++RU3E5Z = 夏季田径运动会(美)
++RU4E41 = 我的健身教练2 运动与营养[平衡板](美)
++RU4PLG = 新个人健身教练[平衡板](欧)
++RU4X41 = 新健身首选私人教练[平衡板](X)
++RU5E4Q = 迪士尼公主和青蛙(美)
++RU5P4Q = 公主与青蛙(欧)
++RU5X4Q = 公主与青蛙(X)
++RU5Y4Q = 公主与青蛙(Y)
++RU6PHY = 自由奔跑(欧)
++RU7E5G = 博物馆奇妙夜2 决战史密森尼(美)
++RU7X5G = 博物馆奇妙夜2 决战史密森尼(X)
++RU9EGT = 我的芭蕾舞工作室(美)
++RU9PGT = 天后女孩 芭蕾天后(欧)
++RUAE52 = 怪物卡车 袭击市区(美)
++RUAP52 = 怪物卡车 袭击市区(欧)
++RUBEVN = 极致桌上游戏合辑(美)
++RUBP7N = 极致桌上游戏合辑(欧)
++RUCE5Z = 冬季运动会 终极挑战 2008(美)
++RUCPRT = 冬季运动会 终极挑战 2008(欧)
++RUCXRT = 冬季运动会 终极挑战 2008(X)
++RUEE4Q = 豚鼠特工队(美)
++RUEP4Q = 豚鼠特工队(欧)
++RUEX4Q = 豚鼠特工队(X)
++RUEY4Q = 豚鼠特攻队(欧)
++RUFEMV = 牧场物语 符文工场 边境(美)
++RUFJ99 = 牧场物语 符文工场 边境(日)
++RUFP99 = 牧场物语 符文工场 边境(欧)
++RUGE7T = 鸡皮疙瘩恐怖乐园(美)
++RUGP5G = 鸡皮疙瘩恐怖乐园(欧)
++RUHE52 = 爆丸 战斗对决(美)
++RUHP52 = 爆丸 战斗对决(欧)
++RUHX52 = 爆丸战士(X)
++RUIE4Q = 迪斯尼 想唱就唱(美)
++RUIP4Q = 迪斯尼 想唱就唱(欧)
++RUIX4Q = 迪斯尼 想唱就唱(X)
++RUKEGT = 我们来摇滚吧 鼓王(美)
++RUKPGT = 我们来摇滚吧 鼓王(欧)
++RULE4Q = 终极乐队[WiFi](美)
++RULP4Q = 终极乐队[WiFi](欧)
++RUME5Z = 滑雪射击[平衡板](美)
++RUMPFR = 夏季田径运动会(欧)
++RUNJ0Q = 新 右脑达人Wii(日)
++RUOEPL = 阁楼里的外星人(美)
++RUOPPL = 阁楼里的外星人(欧)
++RUPJC8 = 赛马大亨7 Maximum 2008(日)
++RUQD78 = 飞屋环游记(德)
++RUQE78 = 飞屋环游记(美)
++RUQI78 = 飞屋环游记(欧)
++RUQJJE = 飞屋环游记(日)
++RUQP78 = 飞屋环游记(欧)
++RUQS78 = 飞屋环游记(西)
++RUREPL = 职业撞球名人堂(美)
++RURPPL = 职业撞球名人堂(欧)
++RUSE78 = 海绵宝宝历险记 致命水珠(美)
++RUSK78 = 海绵宝宝历险记 致命水珠(韩)
++RUSX78 = 海绵宝宝历险记 致命水珠(X)
++RUSY78 = 海绵宝宝历险记 致命水珠(Y)
++RUUE01 = 动物之森 城市大家庭[WiFi](美)
++RUUJ01 = 动物之森 城市大家庭[WiFi](日)
++RUUK01 = 动物之森 城市大家庭[WiFi](韩)
++RUUP01 = 动物之森 城市大家庭[WiFi](欧)
++RUWJC8 = 胜利赛马世界(日)
++RUXXUG = 都市极限飚车 街道之怒(X)
++RUYE41 = 英雄不再2 负隅顽抗(美)
++RUZE7T = 终极挑战者(美)
++RUZP5G = 终极间谍(欧)
++RV2E5D = 游戏聚会2(美)
++RV2P5D = 游戏聚会2(欧)
++RV3P6N = 聪明的孩子 吓人的爬行动物(欧)
++RV7SMR = 幸存者(欧)
++RV8PRT = 海滩暑假快乐挑战(欧)
++RV9E78 = 降世神通 最后的气宗 前往地狱(美)
++RV9P78 = 降世神通 最后的气宗 前往地狱(欧)
++RVAE78 = 降世神通 燃烧的大地(美)
++RVAP78 = 降世神通 燃烧的大地(欧)
++RVBERS = 艾尔文与花栗鼠(美)
++RVBPRS = 艾尔文与花栗鼠(欧)
++RVDPLG = 德伯力克 原罪(欧)
++RVEFMR = 欢迎来到北方(法)
++RVFE20 = 大脚车 碰撞航向(美)
++RVFP7J = 大脚车 碰撞航向(欧)
++RVGE78 = 默夫格里芬纵横字迷(美)
++RVGP78 = 默夫格里芬纵横字迷(欧)
++RVHP41 = 拼字游戏互动2009[WiFi][平衡板](欧)
++RVIE4F = 乐高生化战士(美)
++RVIP4F = 乐高生化战士(欧)
++RVJPFR = 金发美女 回到小岛(欧)
++RVKEXJ = 瓦尔哈拉骑士 艾德尔传奇[WiFi](美)
++RVKJ99 = 瓦尔哈拉骑士 艾德尔传奇[WiFi](日)
++RVLPA4 = 摇滚革命(欧)
++RVNE20 = 凯文塔克的乡巴佬露营会(美)
++RVNP20 = 凯文塔克的乡巴佬露营会(欧)
++RVNP7J = 凯文塔克的乡巴佬露营会(欧)
++RVOEPL = 眩晕滚球[平衡板](美)
++RVOPPL = 眩晕滚球[平衡板](欧)
++RVPEFS = 明星吉他(美)
++RVPPFS = 明星吉他(欧)
++RVQE41 = 电影游戏(美)
++RVQP41 = 电影游戏(欧)
++RVREFS = 叛乱袭击者 夜鹰行动(美)
++RVRPFS = 叛乱袭击者 夜鹰行动(欧)
++RVRPKG = 叛乱袭击者 夜鹰行动(欧)
++RVSE69 = 极限滑板[平衡板](美)
++RVSJ13 = 极限滑板[平衡板](日)
++RVSP69 = 极限滑板[平衡板](欧)
++RVTFMR = 真实故事 兽医(法)
++RVTPMR = 我的宠物俱乐部(欧)
++RVTXMR = 真实故事 兽医(X)
++RVUE8P = VR网球2009[MP][WiFi](美)
++RVUP8P = VR网球2009[MP][WiFi](欧)
++RVVE78 = 大沙滩运动(美)
++RVVP78 = 大沙滩运动(欧)
++RVXFRT = 现代冬季两项2009[平衡板](法)
++RVXPRT = 现代冬季两项2009[平衡板](欧)
++RVYD52 = 使命召唤 世界大战[WiFi](德)
++RVYE52 = 使命召唤 世界大战[WiFi](美)
++RVYK52 = 使命召唤 世界大战[WiFi](韩)
++RVYP52 = 使命召唤 世界大战[WiFi](欧)
++RVYX52 = 使命召唤 世界大战[WiFi](X)
++RVYY52 = 使命召唤 世界大战[WiFi](Y)
++RVZE52 = 怪兽大战外星人(美)
++RVZP52 = 怪兽大战外星人(欧)
++RW3E4Q = 加勒比海盗 世界的尽头(美)
++RW3J4Q = 加勒比海盗 世界的尽头(日)
++RW3P4Q = 加勒比海盗 世界的尽头(欧)
++RW4D41 = 我的词汇教练(德)
++RW5F41 = 谁想成为百万富翁？第二集(法)
++RW5P41 = 谁想成为百万富翁？第二集(欧)
++RW6PA4 = 劲舞革命 美少女俱乐部[跳舞毯](欧)
++RW7E41 = 肖恩怀特滑雪[平衡板](美)
++RW8P41 = 想象 冠军骑士(欧)
++RW9P78 = 世界职业摔角联盟2009[WiFi](欧)
++RW9X78 = 世界职业摔角联盟2009[WiFi](X)
++RWAD78 = 机器人瓦伊(德)
++RWAE78 = 机器人瓦伊(美)
++RWAJ78 = 机器人瓦伊(日)
++RWAK78 = 机器人瓦伊(韩)
++RWAP78 = 机器人瓦伊(欧)
++RWAR78 = 机器人瓦伊(俄)
++RWAU78 = 机器人瓦伊(英)
++RWAX78 = 机器人瓦伊(X)
++RWAY78 = 机器人瓦伊(Y)
++RWAZ78 = 机器人瓦伊(Z)
++RWBENR = 川崎雪橇(美)
++RWBXUG = 川崎雪橇(X)
++RWCE4Z = 荣誉弹珠台 威廉姆斯家族珍藏(美)
++RWCP4Z = 荣誉弹珠台 威廉姆斯家族珍藏(欧)
++RWDC52 = 自制 吉他英雄 下载版(欧)
++RWDE5G = 野生大地 非洲之旅(美)
++RWDP5G = 野生大地 非洲之旅(欧)
++RWEEA4 = 实况足球2008[WiFi](美)
++RWEJA4 = 实况足球2008[WiFi](日)
++RWEPA4 = 实况足球2008[WiFi](欧)
++RWFH41 = 我的单词教练(荷)
++RWGE08 = 全民高尔夫[WiFi](美)
++RWGJ08 = 全民高尔夫[WiFi](日)
++RWGP08 = 全民高尔夫[WiFi](欧)
++RWHP4F = 顶级王牌 神秘博士(欧)
++RWHPWK = 顶级王牌 神秘博士(欧)
++RWIE18 = 翼神之岛(美)
++RWIJ18 = 翼神之岛(日)
++RWIP18 = 翼神之岛(欧)
++RWJENR = 单词琼聚会(美)
++RWJPNR = 单词琼聚会(欧)
++RWKE5G = 料理妈妈 世界厨房(美)
++RWKPGT = 料理妈妈 世界厨房(欧)
++RWLE01 = 瓦里奥大陆 摇动(美)
++RWLJ01 = 瓦里奥大陆 摇动(日)
++RWLP01 = 瓦里奥大陆 摇动(欧)
++RWME78 = 百战天虫 怪异空间(美)
++RWMP78 = 百战天虫 怪异空间(欧)
++RWNF70 = 警告 公路规则(法)
++RWOE69 = 垄断(美)
++RWOJ13 = 垄断(日)
++RWOP69 = 垄断(欧)
++RWQPSP = 真实世界斯诺克冠军赛2008(欧)
++RWRE4F = 古怪赛车 冲撞(美)
++RWRP4F = 古怪赛车 冲撞(欧)
++RWSE8P = 马里奥与索尼克在奥运会[WiFi](美)
++RWSJ01 = 马里奥与索尼克在奥运会[WiFi](日)
++RWSK01 = 马里奥与索尼克在奥运会[WiFi](韩)
++RWSP8P = 马里奥与索尼克在奥运会[WiFi](欧)
++RWTEG9 = BEN 10 外星神力(美)
++RWTPG9 = BEN 10 外星神力(欧)
++RWUE52 = X战警 金钢狼(美)
++RWUP52 = X战警 金钢狼(欧)
++RWUX52 = X战警 金钢狼(X)
++RWWE78 = 世界职业摔角2008[WiFi](美)
++RWWJ78 = 世界职业摔角2008[WiFi](日)
++RWWP78 = 世界职业摔角2008[WiFi](欧)
++RWXES5 = 印第安武士 一个勇士的传说(美)
++RWXPS5 = 印第安武士 一个勇士的传说(欧)
++RWYPHH = 逃亡2 海龟之梦(欧)
++RWZE5G = 奇迹世界游乐园(美)
++RWZP5G = 奇迹世界游乐园(欧)
++RWZX5G = 奇迹世界游乐园(X)
++RX2E70 = 我和我的小马2(美)
++RX2P70 = 我和我的小马2(欧)
++RX3E01 = 激情漫游 特技竞速[WiFi](美)
++RX4PMT = 鬼马小灵精恐怖学校鬼怪的运动日(欧)
++RX5E52 = 托尼霍克 直立滑行(美)
++RX5P52 = 托尼霍克：直立滑行(欧)
++RX6E78 = 减肥达人[平衡板](美)
++RX6P78 = 减肥达人[平衡板](欧)
++RX7JGD = 梅吉玛吉演奏比赛(日)
++RX8JA4 = 实况力量棒球NEXT(日)
++RX9E69 = 极品飞车 卧底(美)
++RX9J13 = 极品飞车 卧底(日)
++RX9K69 = 极品飞车 卧底(韩)
++RX9P69 = 极品飞车 卧底(欧)
++RX9X69 = 极品飞车 卧底(X)
++RX9Y69 = 极品飞车 卧底(Y)
++RXAE78 = 美国职业摔角联盟2010[WiFi](美)
++RXAP78 = 美国职业摔角联盟2010[WiFi](欧)
++RXBE70 = 后院棒球10(美)
++RXBP70 = 后院棒球10(欧)
++RXCE4Z = 戴夫·米拉自行车越野挑战赛(美)
++RXCP4Z = 戴夫·米拉自行车越野挑战赛(欧)
++RXCPGT = 戴夫·米拉自行车越野挑战赛(欧)
++RXDD4Q = 灵机一动(德)
++RXDE4Q = 灵机一动(美)
++RXDJ4Q = 灵机一动(日)
++RXDP4Q = 灵机一动(欧)
++RXDR4Q = 灵机一动(俄)
++RXDX4Q = 灵机一动(X)
++RXDY4Q = 灵机一动(Y)
++RXEJDA = 棒球大联盟Wii(日)
++RXFEVN = 海洋大亨(美)
++RXGE6K = 吉纶立方(美)
++RXHF5D = 混沌之家(法)
++RXIE52 = 变形金刚2 卷土重来[WiFi](美)
++RXIP52 = 变形金刚2 卷土重来[WiFi](欧)
++RXJJDA = 人生游戏Wii EX(日)
++RXKEGL = 电视秀之王聚会(美)
++RXKFGL = 电视秀之王聚会(法)
++RXKPGL = 电视秀之王聚会(欧)
++RXLE41 = 实习医生格蕾(美)
++RXLP41 = 实习医生格蕾(欧)
++RXMJ8P = 米布里和特布里(日)
++RXNEXS = 再次体感钓鱼(美)
++RXNPGT = 大收获 巴斯钓鱼2[MP](欧)
++RXPEXS = 实感钓鱼[WiFi](美)
++RXPJJF = 实感钓鱼[WiFi](日)
++RXPPGT = 实感钓鱼[WiFi](欧)
++RXQEWR = 野兽家园(美)
++RXQPWR = 野兽家园(欧)
++RXRERS = 浪漫鼠德佩罗(美)
++RXRPRS = 浪漫鼠德佩罗(欧)
++RXRXRS = 浪漫的老鼠(欧)
++RXSEA4 = 热舞生涯 劲爆舞会[跳舞毯](美)
++RXSPA4 = 热舞生涯 劲爆舞会[跳舞毯](欧)
++RXUE41 = 冲浪企鹅(美)
++RXUP41 = 冲浪企鹅(欧)
++RXUX41 = 冲浪企鹅(X)
++RXVXWP = 填字游戏(X)
++RXWE20 = 巧克力豆海滩聚会(美)
++RXXE4Q = 化石超进化 起源(美)
++RXXP4Q = 化石超进化 起源(欧)
++RXYE4Z = 更多的难题挑战(美)
++RXYP4Z = 更多的难题挑战(欧)
++RXZE52 = 卡贝拉危险狩猎2009(美)
++RXZP52 = 卡贝拉危险狩猎2009(欧)
++RY2E41 = 雷曼 疯狂兔子2[WiFi](美)
++RY2J41 = 雷曼 疯狂兔子2[WiFi](日)
++RY2K41 = 雷曼 疯狂兔子2[WiFi](韩)
++RY2P41 = 雷曼 疯狂兔子2[WiFi](欧)
++RY2R41 = 雷曼 疯狂兔子2[WiFi](俄)
++RY3E41 = 雷曼 疯狂兔子 电视聚会[平衡板](美)
++RY3J41 = 雷曼 疯狂兔子 电视聚会[平衡板](日)
++RY3K41 = 雷曼 疯狂兔子 电视聚会[WiFi][平衡板](韩)
++RY3P41 = 雷曼 疯狂兔子 电视聚会[WiFi][平衡板](欧)
++RY4J8P = 噗哟噗哟7(日)
++RY5E52 = 夏日运动大联盟(美)
++RY5P52 = 夏日运动大联盟(欧)
++RY6EA4 = 去户外吧[平衡板](美)
++RY6PA4 = 节拍漫步(欧)
++RY7PHZ = 忍者首领(欧)
++RY8EFS = 巴斯专业店 鱼饵(美)
++RYAJDA = 小双侠Wii 噗通噗通大赛车(日)
++RYBE69 = 轰炸方块 猛击聚会[WiFi](美)
++RYBP69 = 轰炸方块 猛击聚会[WiFi](欧)
++RYDELT = 宠物伴侣 动物医生(美)
++RYDP6V = 宠物伴侣 动物医生(欧)
++RYEEEB = 101合1 聚会游戏大合集(美)
++RYEPHZ = 101合1 聚会游戏大合集(欧)
++RYGE9B = 阿尔戈斯战士 筋肉冲击(美)
++RYGJ9B = 阿尔戈斯战士 筋肉冲击(日)
++RYGP99 = 阿尔戈斯战士 筋肉冲击(欧)
++RYHES5 = 虚拟宇宙 扭曲之塔(美)
++RYHPS5 = 虚拟宇宙 扭曲之塔(欧)
++RYIE98 = 涂鸦王子(美)
++RYIE9B = 涂鸦王子(美)
++RYIP9B = 涂鸦王子(欧)
++RYKEAF = 世界滑雪&滑雪板[平衡板](美)
++RYKJAF = 世界滑雪&滑雪板[平衡板](日)
++RYKPAF = 世界滑雪&滑雪板[平衡板](欧)
++RYLDSV = 德国顶级模特(德)
++RYNE6U = 哈迪男孩 隐藏的盗窃(美)
++RYNP6V = 哈迪男孩 隐藏的盗窃(欧)
++RYOEA4 = 游戏王5DS 破碎转轮(美)
++RYOJA4 = 游戏王5DS 破碎转轮(日)
++RYOPA4 = 游戏王5DS 破碎转轮(欧)
++RYQE69 = 打破砂锅问到底(美)
++RYQP69 = 打破砂锅问到底(欧)
++RYQX69 = 打破砂锅问到底(X)
++RYRE41 = 你的塑身(美)
++RYRP41 = 你的塑身(欧)
++RYTE4Z = 职业牛仔骑士公司 斜道之外(美)
++RYVEMS = 街机射击 爱贝罗(美)
++RYVJMS = 伊鲁贝罗Wii(日)
++RYWE01 = 轻松头脑教室(美)
++RYWJ01 = 轻松头脑教室(日)
++RYWK01 = 轻松头脑教室(韩)
++RYWP01 = 轻松头脑教室(欧)
++RYXE20 = 雅马哈超级摩托(美)
++RYXP20 = 雅马哈超级摩托(欧)
++RYXP7J = 雅马哈超级摩托(欧)
++RYZE6U = 世界派对游戏(美)
++RYZPTV = 游玩天下[平衡板](欧)
++RZ2JG9 = 简单Wii系列1大家一起赛车[WiFi](日)
++RZ3JG9 = 简单Wii系列2大家一起钓鱼[WiFi](日)
++RZ4JG9 = 简单Wii系列3 赌场聚会[WiFi](日)
++RZ5JG9 = 简单Wii系列4战斗射击[WiFi](日)
++RZ6JG9 = 简单Wii系列5打砖块[WiFi](日)
++RZ7JG9 = 简单Wii系列6喧哗枪战[WiFi](日)
++RZ8JG9 = 简单2000系列1 桌面游戏(日)
++RZ9EG9 = 简单2000系列2 家庭聚会(美)
++RZ9JG9 = 简单2000系列2 家庭聚会(日)
++RZ9PG9 = 简单2000系列2 家庭聚会(欧)
++RZCE6K = 大圣王(美)
++RZDA01 = 塞尔达传说 黎明公主(A)
++RZDE01 = 塞尔达传说 黎明公主(美)
++RZDJ01 = 塞尔达传说 黎明公主(日)
++RZDK01 = 塞尔达传说 黎明公主(韩)
++RZDP01 = 塞尔达传说 黎明公主(欧)
++RZEE52 = 科学爸爸(美)
++RZEP52 = 科学爸爸(欧)
++RZFPKM = 秘密档案2 清心(欧)
++RZHE5G = 动物医院[WiFi](美)
++RZHP5G = 动物医院[WiFi](欧)
++RZHX5G = 动物医院[WiFi](X)
++RZIPRT = RTL冬季运动会2010(欧)
++RZJD69 = 死亡空间 撤离(德)
++RZJE69 = 死亡太空 撤离(美)
++RZJJ13 = 死亡太空 撤离(日)
++RZJP69 = 死亡太空 撤离(欧)
++RZKE20 = 谜题王国(美)
++RZKP7J = 谜题王国(欧)
++RZLE41 = 烹饪战争(美)
++RZLP41 = 烹饪聚会(欧)
++RZNJ01 = 斩击的女武神[WIFI](日)
++RZOE78 = 动物园世界(美)
++RZOP78 = 动物园世界(欧)
++RZPE01 = 林克的弓箭训练(美)
++RZPJ01 = 林克的弓箭训练(日)
++RZPP01 = 林克的弓箭训练(欧)
++RZREGT = 佐罗的宿命(美)
++RZRPGT = 佐罗的宿命(欧)
++RZSEGJ = 极速地带(美)
++RZSP68 = 飞速赛车(欧)
++RZTE01 = Wii运动 度假胜地[MP](美)
++RZTJ01 = Wii运动 度假胜地[MP](日)
++RZTP01 = Wii运动 度假胜地[MP](欧)
++RZTW01 = Wii运动 度假胜地[MP](中)
++RZUE4Z = 彩色之旅(美)
++RZYE41 = 我的单词教练(美)
++RZYF41 = 我的单词教练(法)
++RZYP41 = 我的单词教练(欧)
++RZYS41 = 我的单词教练(西)
++RZZE8P = 疯狂世界(美)
++RZZJEL = 疯狂世界(日)
++RZZP8P = 疯狂世界(欧)
++S02PES = 自制 唱吧 下载版(欧)
++S2TJAF = 太鼓达人Wii 咚咚与二代目(日)
++S3CENR = 三冠王滑雪锦标赛[平衡板](美)
++S3WEG9 = 家庭聚会 30大冬季游戏(美)
++S3WPG9 = 家庭聚会 30大冬季游戏(欧)
++S59JC8 = 战国无双3(日)
++S80U3Q = 自制 唱吧 下载版(欧)
++SABENR = 外星怪兽保龄球联赛[MP](美)
++SAKENS = 樱花大战5 再见吾爱(美)
++SAKPNS = 樱花大战5 再见吾爱(欧)
++SALE4Q = 爱丽丝漫游仙境(美)
++SALP4Q = 爱丽丝漫游仙境(欧)
++SANT3Q = 自制 唱吧 下载版(欧)
++SAVE5G = 艾尔文与花栗鼠 明星俱乐部(美)
++SAVX5G = 艾尔文与金花鼠 明星俱乐部(欧)
++SAYP41 = 新兵训练营学院(欧)
++SB2ES5 = 我宝宝的第一步(美)
++SB2PNP = 我的宝贝2[WiFi](欧)
++SBBJ18 = 金属战斗陀螺 对决大赛场(日)
++SBDE08 = 生化危机 暗黑编年史[WiFi](美)
++SBDJ08 = 生化危机 暗黑编年史[WiFi](日)
++SBDK08 = 生化危机 暗黑编年史[WiFi](韩)
++SBDP08 = 生化危机 暗黑编年史[WiFi](欧)
++SBFE70 = 后院橄榄球10(美)
++SBHEEP = 雷明顿美洲猎鸟记(美)
++SBHEFP = 雷明顿美洲猎鸟记(美)
++SBLE5G = 男孩与软泥(美)
++SBLP5G = 男孩与软泥(欧)
++SBNEG9 = BEN 10 外星神力 维尔加科斯的攻击(美)
++SBNPG9 = BEN 10 外星神力 维尔加科斯的反击(欧)
++SBOD3Q = 自制 唱吧 下载版(欧)
++SBVE78 = 海绵宝宝 碰碰船竞速(美)
++SBVG3Q = 自制 唱吧 下载版(欧)
++SBVP78 = 海绵宝宝 碰碰船竞速(欧)
++SBZESZ = 百慕大三角 拯救珊瑚礁(美)
++SCAE18 = 鬼来电(美)
++SCAJ18 = 鬼铃 黑暗来电(日)
++SCAP18 = 鬼来电(欧)
++SCBPNK = 自行车运动(欧)
++SCFPNK = 魔怪狂欢节(欧)
++SCNEA4 = 暮光之城(美)
++SCNPA4 = 暮光之城(欧)
++SCREJH = 乡下小鸡大暴乱(美)
++SCRPJH = 小鸡暴乱(欧)
++SCSE52 = 巡洋舰度假游戏[MP](美)
++SCTPNK = 小魔怪惊喜(欧)
++SDAE5G = 女孩们的勇敢游戏(美)
++SDNE41 = 舞梦成真(美)
++SDNP41 = 舞梦成真(欧)
++SDRP3Q = 自制 唱吧 下载版(欧)
++SDTH3Q = 自制 唱吧 下载版(欧)
++SEAE69 = EA运动活力 更多锻炼[平衡板](美)
++SEAJ13 = EA运动活力更多锻炼[平衡板](日)
++SEAP69 = EA运动活力更多锻炼[平衡板](欧)
++SEGE6U = 瑜伽[平衡板](美)
++SEGP6V = 瑜伽[平衡板](欧)
++SEOP4Q = 自制 唱吧 下载版(欧)
++SFAJGD = 钢之炼金术师 黄昏少女(日)
++SFOEAF = 网络食谱 烹饪对战(美)
++SG2EFS = 疯狂迷你高尔夫2(美)
++SG3DSV = 德国超模2010(德)
++SGCE20 = 冰川赛车2(美)
++SGDPKM = 花园一起玩(欧)
++SGI1CL = 自制 唱吧 下载版(欧)
++SGI1DB = 自制 唱吧 下载版(欧)
++SGI1MC = 自制 唱吧 下载版(欧)
++SGI1ML = 自制 唱吧 下载版(自)
++SGI1PT = 自制 唱吧 下载版(自)
++SGI1RC = 自制 唱吧 下载版(自)
++SGIEA4 = GTI汽车俱乐部 世界城市竞速(美)
++SGIJA4 = GTI汽车俱乐部 世界城市竞速(日)
++SGIPA4 = GTI汽车俱乐部 世界城市竞速(欧)
++SGJDSV = 神秘伽利略米达斯王冠(德)
++SGSP7J = 家庭游戏秀(欧)
++SH2JMS = 轻松学跳草裙舞(日)
++SHDE52 = 驯龙记(美)
++SHDP52 = 驯龙记(欧)
++SHFE20 = 篮球名人堂 极限挑战(美)
++SHLPA4 = 寂静岭 破碎的记忆(欧)
++SHMPLR = 调皮的亨利(欧)
++SHOXKR = 雨果 巨魔树林里的魔法(X)
++SHPE5G = 我们的家 聚会[WiFi](美)
++SIABOH = 自制 唱吧 下载版(自)
++SIBBHJ = 自制 唱吧 下载版(自)
++SIFESZ = 弗兰克斯坦博士岛(美)
++SILP4Q = 自制 唱吧 下载版(欧)
++SIS1OH = 自制 唱吧 下载版(欧)
++SIS2OH = 自制 唱吧 下载版(PAL)
++SIS3OH = 自制 唱吧 下载版(欧)
++SIS4OH = 自制 唱吧 下载版(PAL)
++SIS5OH = 自制 唱吧 下载版(欧)
++SIS7OH = 自制 唱吧 下载版(欧)
++SIS80Q = 自制 唱吧 下载版(欧)
++SIS80S = 自制 唱吧 下载版(自)
++SIS90H = 自制 唱吧 下载版(欧)
++SIS9OH = 自制 唱吧 下载版(欧)
++SISAOH = 自制 唱吧 下载版(PAL)
++SISBOH = 自制 唱吧 下载版(欧)
++SISCOH = 自制 唱吧 下载版(欧)
++SISDOH = 自制 唱吧 下载版(欧)
++SISHOH = 自制 唱吧 下载版(欧)
++SISJ0Q = 骨盆瘦身[平衡板](日)
++SISLIP = 自制 唱吧 下载版(欧)
++SISLOH = 自制 唱吧 下载版(欧)
++SISMJ1 = 自制 唱吧 下载版(自)
++SISMOH = 自制 唱吧 下载版(欧)
++SISP10 = 自制 唱吧 下载版(欧)
++SISP12 = 自制 唱吧 下载版(欧)
++SISP34 = 自制 唱吧 下载版(欧)
++SISPOH = 自制 唱吧 下载版(欧)
++SISPOP = 自制 唱吧 下载版(欧)
++SISQ3Q = 自制 唱吧 下载版(欧)
++SISR3Q = 自制 唱吧 下载版(欧)
++SISRP4 = 自制 唱吧 下载版(欧)
++SISSOH = 自制 唱吧 下载版(欧)
++SISTDK = 迪斯尼 想唱就唱 土耳其聚会(欧)
++SJEEPK = JumpStart 逃离冒险岛(美)
++SJME5G = 吉利安 麦克尔的健身训练2010[平衡板](美)
++SJSEPK = 宠物营救(美)
++SKMJAF = 假面骑士 巅峰英雄W(日)
++SKREG9 = 假面骑士 龙骑士(美)
++SLPP5D = 狼的精神(欧)
++SLTPLG = NewU健身 瑜伽与普拉提[平衡板](欧)
++SLWE41 = 沃尔多在哪里？ 梦幻之旅(美)
++SM4E20 = 大脚怪物卡车大破坏(美)
++SMAENR = 海军陆战队 现代城市战(美)
++SMBE8P = 超级猴子球 平衡滚球[平衡板](美)
++SMBJ8P = 超级猴子球 平衡滚球[平衡板](日)
++SMBP8P = 超级猴子球 平衡滚球[平衡板](欧)
++SMCENR = 我们祝你圣诞快乐(美)
++SMIG3Q = 自制 唱吧 下载版(欧)
++SMLE54 = 职业棒球大联盟2010(美)
++SMNE01 = 新超级马里奥兄弟Wii(美)
++SMNJ01 = 新超级马里奥兄弟Wii(日)
++SMNP01 = 新超级马里奥兄弟Wii(欧)
++SMOT3Q = 自制 唱吧 下载版(欧)
++SMTJ18 = 桃太郎电铁2010 战国 维新英雄大集合！之卷(日)
++SMUJAF = 大怪兽格斗 终极竞技场DX 终极战士大集结(日)
++SN4JDA = 火影忍者疾风传 龙刃记(日)
++SOKJ18 = 卡拉OK 欢乐之声Wii DX(日)
++SP9P4Q = 自制 唱吧 下载版(欧)
++SPBPGT = 魅力聚会(欧)
++SPMDRM = 麻将聚会(德)
++SPPEFS = 力量拳击(美)
++SPRE41 = 正确定价 2010版(美)
++SPZE5G = 批萨外卖派送小子(美)
++SRAJMS = 电波少女诺亚Wii(日)
++SRBP4Q = 自制 唱吧 下载版(欧)
++SRBPHS = 联盟式橄榄球3[MP](欧)
++SRME18 = 奇幻房间(美)
++SRMJ18 = Rooms 神秘的移动房间(日)
++SRNE70 = 天桥骄子[平衡板](美)
++SRQE41 = 球拍运动[MP](美)
++SRRENR = 消遣游戏室[MP](美)
++SSCDWR = 电影场景猜猜 明亮的灯光与大屏幕(德)
++SSCEPM = 电影场景猜猜 明亮的灯光与大屏幕(美)
++SSCFPM = 电影场景猜猜 明亮的灯光与大屏幕(法)
++SSCFWR = 电影场景猜猜 明亮的灯光与大屏幕(法)
++SSCIWR = 电影场景猜猜 明亮的灯光与大屏幕(意)
++SSCPWR = 电影场景猜猜 明亮的灯光与大屏幕(欧)
++SSCSWR = 电影场景猜猜 明亮的灯光与大屏幕(西)
++SSGPNG = 我们唱歌[麦克风](欧)
++SSIENR = 冬季爆发 九大冰雪运动[平衡板](美)
++SSUES5 = 回转寿司(美)
++SSWDRM = 水上运动[平衡板](德)
++SSWEPT = 水上运动[平衡板](美)
++SSWEPZ = 水上运动[平衡板](美)
++SSWPGR = 水上运动[平衡板](欧)
++ST8P75 = 自制 唱吧 下载版(欧)
++STAP75 = 自制 唱吧 下载版(欧)
++STCP75 = 自制 唱吧 下载版(欧)
++STDP75 = 自制 唱吧 下载版(欧)
++STGJAF = 圣恩传说(日)
++STHP75 = 自制 唱吧 下载版(欧)
++STKE08 = 龙之子Vs.卡普空 究极全明星(美)
++STKJ08 = 龙之子Vs.卡普空 究极全明星(日)
++STKP08 = 龙之子Vs.卡普空 究极全明星(欧)
++STPP75 = 自制 唱吧 下载版(欧)
++STQP75 = 自制 唱吧 下载版(欧)
++STRP75 = 自制 唱吧 下载版(欧)
++STSP75 = 自制 唱吧 下载版(欧)
++STTDRM = 隐藏之谜 泰坦尼克秘密宿命之旅(德)
++STTE52 = 隐藏之谜 泰坦尼克秘密宿命之旅(美)
++SUMJC8 = 胜利赛马世界2010(日)
++SUXEA4 = 实况足球2010[WiFi](美)
++SUXJA4 = 实况足球2010[WiFi](日)
++SUXPA4 = 实况足球2010[WiFi](欧)
++SUXXA4 = 实况足球2010[WiFi](X)
++SUXYA4 = 实况足球2010[WiFi](Y)
++SVPESZ = 维加斯聚会(美)
++SWAE52 = DJ英雄[WiFi](美)
++SWAP52 = DJ英雄[WiFi](欧)
++SXAE52 = 吉他英雄 世界巡演[WiFi](美)
++SXAP52 = 吉他英雄 世界巡演[WiFi](欧)
++SXBE52 = 吉他英雄 金属乐队专辑[WiFi](美)
++SXBP52 = 吉他英雄 金属乐队专辑[WiFi](欧)
++SXCE52 = 吉他英雄 流行精选[WiFi](美)
++SXCP52 = 吉他英雄 流行精选[WiFi](欧)
++SXDE52 = 吉他英雄 范海伦[WiFi](美)
++SXDP52 = 吉他英雄 范海伦[WiFi](欧)
++SXEE52 = 吉他英雄5[WiFi](美)
++SXEP52 = 吉他英雄5[WiFi](欧)
++SXFE52 = 乐团英雄[WiFi](美)
++SXFP52 = 乐团英雄[WiFi](欧)
++SZAE69 = 摇滚乐队2[WiFi](美)
++SZAP69 = 摇滚乐队2[WiFi](欧)
++W2CE = 脑力挑战(美)
++W2CP = 脑力挑战(欧)
++W2KE = 一起来接球(美)
++W2KP = 一起来接球(欧)
++WA2E = 大家的旋转泡泡(美)
++WB2E = 大坏蛋 第四季(美)
++WB2P = 大坏蛋 第四季(欧)
++WB3E = 大坏蛋 第五季(美)
++WB3P = 大坏蛋 第五季(欧)
++WB5E = 豪华打砖块(美)
++WB5P = 豪华打砖块(欧)
++WB6E = 电视节目之王(美)
++WB6P = 电视节目之王(欧)
++WB8E = 午夜保龄球(美)
++WB8P = 午夜保龄球(欧)
++WBPP = 翻板颜料宇宙(欧)
++WBQP = 星际战士R(欧)
++WBRP = 海盗 梦想的钥匙(欧)
++WBSE = 梦幻泡沫(美)
++WBSP = 梦幻泡沫(欧)
++WBVP = 轮胎赛车(欧)
++WBWE = 动物危机(美)
++WBXE = 大坏蛋 第一季(美)
++WBXP = 大坏蛋 第一季(欧)
++WBYE = 大坏蛋 第二季(美)
++WBYP = 大坏蛋 第二季(欧)
++WBZE = 大坏蛋 第三季(美)
++WBZP = 大坏蛋 第三季(欧)
++WCOP = 小魔怪钓鱼(欧)
++WDFE = 守卫城堡(美)
++WDFP = 守卫城堡(欧)
++WDHE = 艺术风格:旋转方块(美)
++WDHP = 艺术风格:旋转方块(欧)
++WDME = 马里奥医生&细菌扑灭(美)
++WFCE = 小小国王与约定之国(美)
++WFCP = 小小国王与约定之国(欧)
++WGYE = 螺旋射击(美)
++WINP = 难以置信的迷宫(欧)
++WKDE = 海盗 梦想的钥匙(美)
++WKDP = 海盗 梦想的钥匙(欧)
++WLWE = 迷失之风(美)
++WLWP = 迷失之风(欧)
++WM8P = 炸弹人爆炸(欧)
++WMDE = 疯狂石头(美)
++WOBP = 艺术风格:万有引力(欧)
++WP2P = 益智小精灵(欧)
++WPPE = 家庭乒乓球(美)
++WPQE = 邻海空袭(美)
++WPRP = 艺术风格:立方体(欧)
++WR9E = 洛克人9(美)
++WR9P = 洛克人9(欧)
++WRXE = 洛克人10(美)
++WRXP = 洛克人10(欧)
++WSWP = 剑与勇士(欧)
++WTPE = 俄罗斯方块聚会(美)
++WTPP = 俄罗斯方块聚会(欧)
++WTTE = 小鸡快跑(美)
++WTTP = 小鸡快跑(欧)
++WVCE = V.I.P 赌场:21点(美)
++XBKE52 = 自制 吉他英雄3 下载版(美)
++XNWE52 = 自制 吉它英雄3 Nightwish(美)
++#以下是为BOOK-MOD需要新增的频道及WiiWare/VC/Forwarder等名称
++JODI = HBC频道
++HABA = 在线商店频道(小心在线升级)
++HAGE = 新闻频道
++HAFE = 气象频道
++HACA = Mii频道
++HACE = Mii频道
++HAYA = 照片频道
++HAYE = 照片频道
++WTPE = 俄罗斯方块聚会
+diff -ruwN wiiflow-r42/wii/wiiflow/ttitles.ini wiiflow-r42-book-mod-r7/wii/wiiflow/ttitles.ini
+--- wiiflow-r42/wii/wiiflow/ttitles.ini	Thu Jan  1 08:00:00 1970
++++ wiiflow-r42-book-mod-r7/wii/wiiflow/ttitles.ini	Tue Mar 23 15:29:18 2010
+@@ -0,0 +1,2535 @@
++
++[TITLES]
++010E01 = Wii 備份盤 v1.31(美)
++0TFE00 = 模擬NAND中游戲運行器(美)
++0TFP00 = 模擬NAND中游戲運行器(歐)
++0WME00 = Wad管理器 v1.5(美)
++BEPS01 = 自制 吉他英雄 下載版(西)
++C3BE52 = 自制 吉他英雄3 下載版(美)
++C3FP52 = 自制 吉他英雄3 下載版(歐)
++C3ME52 = 自制 吉他英雄3 下載版(美)
++C3PP52 = 自制 吉他英雄3 現代流行與搖滾(歐)
++C64J00 = Wii64 模擬器(日)
++C64P00 = 任天堂N64模擬器(歐)
++C80E52 = 自制 吉他英雄 下載版(美)
++C80P52 = 自制 吉他英雄3 下載版(歐)
++CANE52 = 自制 吉他英雄 下載版(美)
++CCCE00 = Check Mii Out頻道(美)
++CCCP00 = Check Mii Out頻道(歐)
++CCRP00 = 都市打靶(歐)
++CDCP00 = 磁盤裝載軟件(歐)
++CDMP00 = 龍媒播放器(歐)
++CFCP00 = FCE Ultra任天堂FC模擬器(歐)
++CFTP00 = FTP服務器(歐)
++CG1E52 = 自制 吉他英雄3 下載版(美)
++CG1P52 = 自制 吉他英雄3 下載版(歐)
++CG2E52 = 自制 吉他英雄3 下載版(美)
++CG2EFL = 自制 吉他英雄3 下載版(美)
++CG2P52 = 自制 吉他英雄3 下載版(歐)
++CG3ECS = 自制 吉他英雄3 下載版(美)
++CG3PCS = 自制 吉他英雄 下載版(歐)
++CGBE52 = 自制 搖滾樂團(美)
++CGBP52 = 自制 吉他英雄3 搖滾樂隊(歐)
++CGCP00 = GC備份加載器(歐)
++CGH3IM = 自制 吉他英雄3 下載版(歐)
++CGH3ME = 自制 吉他英雄3 下載版(歐)
++CGH3WD = 自制 吉他英雄3 下載版(歐)
++CGHE87 = 自制 吉他英雄3 下載版(美)
++CGHE88 = 自制 吉他英雄3 下載版(美)
++CGHE89 = 自制 吉他英雄3 下載版(美)
++CGHE90 = 自制 吉他英雄3 下載版(美)
++CGHE91 = 自制 吉他英雄3 下載版(美)
++CGHE92 = 自制 吉他英雄3 下載版(美)
++CGHE93 = 自制 吉他英雄3 下載版(美)
++CGHE94 = 自制 吉他英雄3 下載版(美)
++CGHE95 = 自制 吉他英雄3 下載版(美)
++CGHE96 = 自制 吉他英雄3 下載版(美)
++CGHE97 = 自制 吉他英雄3 下載版(美)
++CGHE98 = 自制 吉他英雄3 下載版(美)
++CGHE99 = 自制 吉他英雄3 下載版(美)
++CGHECB = 自制 吉他英雄3 下載版(美)
++CGHEDC = 自制 吉他英雄3 下載版(美)
++CGHEDM = 自制 吉他英雄3 下載版(美)
++CGHEMC = 自制 吉他英雄3 下載版(美)
++CGHENC = 自制 吉他英雄3 下載版(美)
++CGHEPH = 自制 吉他英雄3 下載版(美)
++CGHER2 = 自制 吉他英雄3 下載版(美)
++CGHPF2 = 自制 吉他英雄3 下載版(歐)
++CGHPF3 = 自制 吉他英雄3 下載版(歐)
++CGHPF4 = 自制 吉他英雄3 下載版(歐)
++CGHPF5 = 自制 吉他英雄3 下載版(歐)
++CGHPNT = 自制 吉他英雄 下載版(歐)
++CGHRH2 = 自制 吉他英雄3 搖滾精選v2(自)
++CGIE52 = 自制 吉他英雄 下載版(美)
++CGPP00 = 世嘉MD模擬器(歐)
++CGSP52 = 自制 吉他英雄 下載版(歐)
++CGVECD = 自制 吉他英雄 下載版(美)
++CGVEM2 = 自制 吉他英雄 下載版(美)
++CGVEMC = 自制 吉他英雄 下載版(美)
++CGVEUV = 自制 吉他英雄 下載版(美)
++CGXP00 = GeexBox播放器(歐)
++CHBP00 = 自制頻道瀏覽器(歐)
++CHCE00 = 自制頻道(美)
++CHCJ00 = 自制頻道(日)
++CHCK00 = 自制頻道(韓)
++CHCP00 = 自制頻道(歐)
++CICE00 = 網絡頻道(美)
++CICP00 = 網絡頻道(歐)
++CJQP00 = 寶石探秘(歐)
++CLAPSI = 自制 唱吧 下載版(歐)
++CLMP00 = 自制程序裝載器(歐)
++CMDE52 = 自制 吉他英雄3 下載版(美)
++CMIE00 = Mii頻道(美)
++CMIP00 = Mii頻道(歐)
++CMJP00 = 自制 麻將 Wii(歐)
++CMMP00 = 我的自制菜單(歐)
++CMPE00 = MPlayerCE播放器(歐)
++CMPP00 = MPlayer-CE播放器(歐)
++CNCE00 = 新聞頻道(美)
++CNCP00 = 新聞頻道(歐)
++CNGP00 = NeoGammA加載器(歐)
++CPCE00 = 照片頻道(美)
++CPCP00 = 照片頻道1.0_1.1(歐)
++CPLP00 = Priiloader(歐)
++CSCE00 = Wii購物頻道(美)
++CSCP00 = 購物頻道(歐)
++CSME00 = wii系統菜單(美)
++CSMP00 = 世嘉SMS模擬器(歐)
++CSNE00 = Snes9x超任模擬器(美)
++CSNP00 = Snes9x超任模擬器(歐)
++CSTP00 = Wii紙牌(歐)
++CSVE00 = ScummVM模擬器(美)
++CSVP00 = ScummVM模擬器(歐)
++CTFP00 = 模擬NAND中游戲運行器(歐)
++CVBP00 = VBA模擬器(歐)
++CWCE00 = 天氣頻道(美)
++CWCP00 = 天氣頻道(歐)
++CWEP00 = Wii地球(歐)
++CWMP00 = WAD管理器 v1.5(歐)
++CWRE00 = Wii電臺(美)
++CWRP00 = Wii電臺(歐)
++CWXP00 = Wii資源管理器(歐)
++DHKE18 = 努力工作的人(美)
++DMHE08 = 怪物獵人3試玩版(美)
++DMHJ08 = 怪物獵人3試玩版[WiFi](日)
++DMSP4Q = 迪斯尼電影 想唱就唱(歐)
++DQAJK2 = 水瓶座棒球(日)
++DRP22Q = 自制 唱吧 下載版(歐)
++DZDE01 = 塞爾達傳說 黎明公主 試玩版(美)
++E62P = 太空哈利(歐)
++E6NP = 所羅門之鑰(歐)
++E6VP = 立體空戰(歐)
++E6XP = 獸王記(歐)
++E7FJ = 龍魂2(日)
++E7GJ = 龍魂(日)
++EA2P = 合金彈頭2(歐)
++EAAP = 餓狼傳說(歐)
++EAEP = 侍魂(歐)
++EAJP = 合金彈頭(歐)
++EANP = 餓狼傳說2(歐)
++EASP = 侍魂2(歐)
++FCWP = 超級馬里奧兄弟3(歐)
++FD7P = 洛克人3(歐)
++HMBE00 = Multiboot(美)
++HMME00 = 我的自制菜單(美)
++HSDE00 = SuperDump 1.3(美)
++HWME00 = Wad管理器 v1.5(美)
++HWRE00 = Wii電臺(美)
++JA4P = 超魔界村R(歐)
++JA6E = 僵尸鄰居(美)
++JA6P = 僵尸鄰居(歐)
++JAEP = 大金剛世界(歐)
++JAVP = 超級銀河戰士(歐)
++JBTP = 超級戰士(歐)
++JCJP = 超級出拳出局(歐)
++JDNE = 鬼屋歷險(美)
++L40P4Q = 自制 唱吧 下載版(歐)
++MECPSI = 自制 唱吧 下載版(歐)
++MIJPSI = 自制 唱吧 下載版(歐)
++MILPSI = 自制 唱吧 下載版(歐)
++NAAE = 超級馬里奧64(美)
++NABE = 馬里奧賽車64(美)
++NACE = 塞爾達傳說 時光之笛(美)
++NACP = 塞爾達傳說 時光之笛(歐)
++NADE = 星際火狐64(美)
++NADP = 火狐戰隊(歐)
++NAEE = 紙片馬里奧(美)
++NAEP = 紙片馬里奧(歐)
++NAFE = 未來賽車X(美)
++NAFP = 未來賽車X(歐)
++NAHE = 耀西的故事(美)
++NAHP = 耀西的故事(歐)
++NAIE = 水上摩托64(美)
++NAJL = 罪與罰(自)
++NAKE = 口袋妖怪 即可拍(美)
++NALE = 任天堂明星大亂斗(美)
++NALP = 任天堂明星大亂斗(歐)
++NAME = 星之卡比64 水晶碎片(美)
++NAMP = 星之卡比64 水晶碎片(歐)
++NANE = 口袋妖怪謎題聯盟(美)
++NAOE = 1080度 單板滑雪(美)
++NAOP = 1080度 單板滑雪(歐)
++NARP = 塞爾達傳說 姆吉拉的假面(歐)
++NASE = 極速狂飆(美)
++NASP = 極速狂飆(歐)
++NAUE = 馬里奧高爾夫(美)
++ONKELZ = 自制 唱吧 下載版(美)
++OTFPSI = 自制 唱吧 下載版(歐)
++POPPSI = 自制 唱吧 下載版(歐)
++R01PET = 自制 唱吧 下載版(歐)
++R02PEA = 自制 唱吧 下載版(歐)
++R15POH = 自制 唱吧 下載版(歐)
++R23E52 = 芭比與三個火槍手(美)
++R23P52 = 芭比與三個火槍手(歐)
++R24J01 = 用Wii游玩小小機器人(日)
++R26E5G = 街機經典(美)
++R27E54 = 小探險家多拉 多拉拯救水晶王國(美)
++R27X54 = 小探險家多拉 多拉拯救水晶王國(X)
++R29E52 = 世界彩彈錦標賽2009(美)
++R29P52 = 世界彩彈錦標賽2009(歐)
++R2AE7D = 冰河世紀2 消融(美)
++R2AP7D = 冰河世紀2 消融(歐)
++R2AX7D = 冰河世紀2 消融(X)
++R2DEEB = 多卡波王國(美)
++R2DJEP = 多卡波王國for Wii(日)
++R2DPAP = 多卡波王國(歐)
++R2EJ99 = 魚之眼Wii(日)
++R2FE5G = 小魚弗雷迪 丟失的海藻種盒(美)
++R2FP70 = 小魚弗雷迪 丟失的海藻種盒(歐)
++R2GEXJ = 廢墟迷宮 再見月的廢墟(美)
++R2GJAF = 廢墟 再見月的廢墟(日)
++R2GP99 = 廢墟迷宮 再見月的廢墟(歐)
++R2HE41 = 想象 冠軍騎士(美)
++R2IE69 = 美式橄欖球大聯盟10[WiFi](美)
++R2IP69 = 美式橄欖球大聯盟10[WiFi](歐)
++R2JJAF = 太鼓達人Wii(日)
++R2KE54 = 唐金拳擊[平衡板](美)
++R2KP54 = 唐金拳擊[平衡板](歐)
++R2LJMS = 草裙舞Wii[平衡板](日)
++R2ME20 = 巧克力豆大冒險(美)
++R2NE69 = 納斯卡卡丁車賽(美)
++R2NP69 = 納斯卡卡丁車賽(歐)
++R2OE68 = 中世紀游戲(美)
++R2OP68 = 中世紀游戲(歐)
++R2PE9B = 魔法飛球2(美)
++R2PJ9B = 魔法飛球2(日)
++R2PKZ4 = 魔法飛球2(韓)
++R2PP99 = 魔法高爾夫(歐)
++R2PP9B = 魔法高爾夫(歐)
++R2QJC0 = 料理媽媽 世界廚房(日)
++R2RP4F = 小馬伙伴2(歐)
++R2SE18 = 德卡運動會2[WiFi](美)
++R2SJ18 = 德卡運動會2(日)
++R2SP18 = 德卡運動會2(歐)
++R2TE41 = 忍者神龜 毀滅[WiFi](美)
++R2TP41 = 忍者神龜 毀滅[WiFi](歐)
++R2UE8P = 一起來敲打(美)
++R2UJ8P = 一起來敲打(日)
++R2UP8P = 一起來敲打(歐)
++R2VE01 = 罪與罰2(美)
++R2VJ01 = 罪與罰 宇宙的后繼者[WiFi](日)
++R2VP01 = 罪與罰2[WiFi](歐)
++R2WEA4 = 實況足球2009[WiFi](美)
++R2WJA4 = 實況足球2009[WiFi](日)
++R2WPA4 = 實況足球2009[WiFi](歐)
++R2WXA4 = 實況足球2009[WiFi](X)
++R2YE54 = 我的生日(美)
++R2YP54 = 我的生日(歐)
++R32J01 = 用Wii玩銀河戰士Prime2黑暗回音(日)
++R33E69 = 搖滾樂團 樂曲擴展包2(美)
++R33P69 = 搖滾樂團 樂曲擴展包2(歐)
++R34E69 = 搖滾樂團 鄉村音樂包(美)
++R35JC8 = 三國志11 威力加強版(日)
++R37E69 = 搖滾樂隊 金屬 樂曲包(美)
++R38E78 = 漫畫超級英雄戰隊(美)
++R38P78 = 漫畫超級英雄戰隊(歐)
++R38X78 = 漫畫超級英雄戰隊 沃爾瑪版(X)
++R38Y78 = 漫畫超級英雄戰隊(Y)
++R39EFP = 禧碼諾極限釣魚(美)
++R3AE20 = 故事時間 冒險故事(美)
++R3AP20 = 故事時間 冒險故事(歐)
++R3AP7J = 故事時間 冒險故事(歐)
++R3BE8P = 快樂桑巴[WiFi](美)
++R3BJ8P = 快樂桑巴[WiFi](日)
++R3BP8P = 快樂桑巴[WiFi](歐)
++R3CE20 = 克萊斯勒經典賽車(美)
++R3CP20 = 克萊斯勒經典賽車(歐)
++R3CP7J = 克萊斯勒經典賽車(歐)
++R3DES5 = 夢幻彈球3D(美)
++R3DPS5 = 夢幻彈球3D(歐)
++R3EEWR = 游戲派對3(美)
++R3EPWR = 游戲聚會3(歐)
++R3FJA4 = 實況力量棒球大聯盟3(日)
++R3GXUG = 國際兒童 瘋狂小型高爾夫(X)
++R3HP6Z = 特工雨果 熱帶假期(歐)
++R3HX6Z = 特工雨果 熱帶假期(X)
++R3IJ01 = 用Wii玩銀河戰士Prime(日)
++R3JE5G = 去玩吧馬戲團明星[平衡板](美)
++R3KP6N = 摩天大樓(歐)
++R3ME01 = 銀河戰士Prime 三部曲(美)
++R3MP01 = 銀河戰士Prime 三部曲(歐)
++R3NEXS = 罪惡裝備XX Accent Core 加強版(美)
++R3PE52 = 極速賽車手(美)
++R3PEWR = 極速賽車手(美)
++R3PJ52 = 極速賽車手(日)
++R3PPWR = 極速賽車手(歐)
++R3RE8P = 索尼克與世嘉全明星賽車(美)
++R3RP8P = 索尼克與世嘉全明星賽車(歐)
++R3SE52 = 蜘蛛俠 影之網(美)
++R3SP52 = 蜘蛛俠 影之網(歐)
++R3TE54 = 上旋高手3(美)
++R3TJG9 = 上旋高手3(日)
++R3TP54 = 上旋高手3(歐)
++R3UJGD = 親子游戲 米菲兔的玩具(日)
++R3VEFP = 麋鹿獵人(美)
++R3VPFP = 麋鹿獵人(歐)
++R3XE6U = 山姆和邁克斯第一季(美)
++R3XP6V = 山姆和邁克斯第一季(歐)
++R3YE70 = 山姆和麥克斯2 超越時空(美)
++R3YP70 = 山姆和麥克斯2 超越時空(歐)
++R3ZE69 = 搖滾樂隊樂曲包 經典搖滾(美)
++R42E69 = 模擬人生2 生存游戲(美)
++R42P69 = 模擬人生2 生存游戲(歐)
++R43E69 = EA運動活力[平衡板](美)
++R43J13 = EA運動活力[平衡板](日)
++R43P69 = EA運動活力[平衡板](歐)
++R44J8P = 涼宮春日的并列(日)
++R46ENS = 靈武戰記Wii(美)
++R46JKB = 靈武戰記Wii(日)
++R47E20 = ATV沙灘車之王(美)
++R48E7D = 奇幻精靈事件簿(美)
++R48P7D = 奇幻精靈事件簿(歐)
++R49E01 = 大金剛 叢林敲擊(美)
++R49J01 = 大金剛 叢林敲擊(日)
++R49P01 = 大金剛 叢林敲擊(歐)
++R4AE69 = 模擬動物(美)
++R4AJ13 = 模擬動物(日)
++R4AP69 = 模擬動物(歐)
++R4BEJZ = 桌面足球(美)
++R4BPGT = 桌面足球(歐)
++R4CE69 = 模擬城市 建筑大師[WiFi](美)
++R4CJ13 = 模擬城市 建筑大師[WiFi](日)
++R4CK69 = 模擬城市 建筑大師[WiFi](韓)
++R4CP69 = 模擬城市 建筑大師[WiFi](歐)
++R4DDUS = 三個問號 高校之迷(德)
++R4EE01 = 永恒蔚藍 藍色世界(美)
++R4EJ01 = 永恒蔚藍2 海的呼喚(日)
++R4EP01 = 永恒蔚藍2(歐)
++R4FE20 = 故事時間 童話故事(美)
++R4FP20 = 故事時間 童話故事(歐)
++R4FP7J = 故事時間 童話故事(歐)
++R4IPNK = 瘋狂玩具車(歐)
++R4LXUG = 田徑豬派對(X)
++R4MJ0Q = 使頭腦變靈活Wii(日)
++R4NE5G = 大小調的莊嚴進行曲(美)
++R4NP5G = 大小調的莊嚴進行曲(歐)
++R4PE69 = 模擬人生2 寵物(美)
++R4PP69 = 模擬人生2 寵物(歐)
++R4QE01 = 馬里奧激情足球[WiFi](美)
++R4QJ01 = 馬里奧激情足球[WiFi](日)
++R4QK01 = 馬里奧激情足球[WiFi](韓)
++R4QP01 = 馬里奧激情足球[WiFi](歐)
++R4RE69 = FIFA足球10[WiFi](美)
++R4RJ13 = FIFA足球10[WiFi](日)
++R4RP69 = FIFA足球10[WiFi](歐)
++R4RX69 = FIFA足球10[WiFi](X)
++R4RY69 = FIFA足球10[WiFi](Y)
++R4RZ69 = FIFA足球10[WiFi](美)
++R4SE54 = 北美職棒超明星(美)
++R4VEA4 = 故事繪本工坊(美)
++R4VJA4 = 電視劇場Wii[WiFi](日)
++R4VJAF = 電視劇場Wii[WiFi](日)
++R4WJA4 = 實況力量棒球大聯盟2009(日)
++R4YJ2M = 貓社長蕾娜Wii(日)
++R4ZE01 = 零月蝕之假面(美)
++R4ZJ01 = 零 月蝕之假面(日)
++R52E08 = 尼奧寵物謎題大冒險(美)
++R52P08 = 尼奧寵物謎題大冒險[WiFi](歐)
++R54FMR = 倒數游戲(法)
++R55F41 = 誰想成為百萬富翁(法)
++R55P41 = 誰想成為百萬富翁(歐)
++R56EG9 = 鐵臂阿童木(美)
++R56PG9 = 鐵臂阿童木(歐)
++R57FMR = 聯合答題冠軍(法)
++R58DMR = 你來唱[麥克風](德)
++R58FMR = 你來唱[麥克風](法)
++R58PMR = 你來唱[麥克風](歐)
++R58SMR = 你來唱[麥克風](西)
++R5AE8P = 黃金羅盤(美)
++R5AP8P = 黃金羅盤(歐)
++R5AX8P = 黃金羅盤(X)
++R5EPMR = 倒計時(歐)
++R5FE41 = 冠軍學院 足球[MP][平衡板](美)
++R5FP41 = 冠軍學院 足球[MP][平衡板](歐)
++R5GE78 = 你比五年級生聰明嗎(美)
++R5IE4Q = 玩具總動員(美)
++R5IP4Q = 玩具總動員(歐)
++R5IX4Q = 玩具總動員(X)
++R5JES5 = 海盜VS忍者 躲避球(美)
++R5JPS5 = 海盜VS忍者 躲避球(歐)
++R5MJAF = 語言解謎 文字拼詞Wii豪華版(日)
++R5NJN9 = 多阿拉Wii(日)
++R5OENR = 田徑豬派對(美)
++R5OXUG = 田徑豬派對(X)
++R5PE69 = 哈利波特與鳳凰社(美)
++R5PJ13 = 哈利波特與鳳凰社(日)
++R5PP69 = 哈利波特與鳳凰社(歐)
++R5PX69 = 哈利波特與鳳凰社(X)
++R5SERW = 幽靈莊園的秘密(美)
++R5TE69 = 大滿貫網球[MP][WiFi](美)
++R5TJ13 = 大滿貫網球[MP][WiFi](日)
++R5TP69 = 大滿貫網球[MP][WiFi](歐)
++R5UE41 = 犯罪現場調查 致命意圖(美)
++R5UP41 = CSI犯罪現場 致命意圖(歐)
++R5VE41 = 神之化身 詹姆斯·卡麥隆(美)
++R5VP41 = 阿凡達(歐)
++R5VX41 = 神之化身 詹姆斯·卡麥隆(X)
++R5WEA4 = 寂靜嶺 破碎的記憶(美)
++R5WJA4 = 寂靜嶺 破碎的記憶(日)
++R5XJ13 = 我的模擬人生 特工(日)
++R5XP69 = 我的模擬人生 特工(歐)
++R5YD78 = 全明星啦啦隊[平衡板](德)
++R5YE78 = 全明星啦啦隊2[平衡板](美)
++R5YP78 = 全明星啦啦隊2[平衡板](歐)
++R62E4Q = 迪士尼 想唱就唱 流行節奏(美)
++R62P4Q = 迪士尼 想唱就唱 流行節奏(歐)
++R63EG9 = 家庭聚會 30款有趣的戶外游戲(美)
++R63PG9 = 家庭聚會 30款有趣的戶外游戲(歐)
++R64E01 = Wii音樂[平衡板][WiFi](美)
++R64J01 = Wii音樂[平衡板][WiFi](日)
++R64K01 = Wii音樂[平衡板][WiFi](韓)
++R64P01 = Wii音樂[平衡板][WiFi](歐)
++R65ENR = 獵鹿狂(美)
++R66E41 = 按你的運氣 2010版(美)
++R68E5G = 去玩吧 城市運動[平衡板](美)
++R69E36 = 塵埃2(美)
++R69P36 = 塵埃2(歐)
++R6APPU = 寶貝和我(歐)
++R6BE78 = 顏料寶貝(美)
++R6BJ78 = 顏料寶貝(日)
++R6BK78 = 顏料寶貝(韓)
++R6BP78 = 顏料寶貝(歐)
++R6BX78 = 顏料寶貝(X)
++R6CEAF = 大家的啦啦隊2(美)
++R6DFJW = 警告 公路規則(法)
++R6EE41 = 家庭智力搶答 2010版(美)
++R6FE41 = 六旗主題樂園(美)
++R6FERS = 六旗主題樂園(美)
++R6FP41 = 歡樂園聚會(歐)
++R6GPMR = 黃金球(歐)
++R6HE54 = 你好，開蘭 超級游戲日(美)
++R6IE54 = 棒球沖擊波[MP](美)
++R6JJGD = 鋼之煉金術師 曉之王子(日)
++R6KP36 = 灰燼杯板球2009(歐)
++R6KU36 = 灰燼杯板球賽2009(英)
++R6LEWR = 樂高搖滾樂隊(美)
++R6LPWR = 樂高搖滾樂團(歐)
++R6MPML = 全美超模大賽(歐)
++R6NE41 = 肖恩懷特滑雪 世界舞臺[MP][平衡板](美)
++R6NY41 = 肖恩懷特滑雪 世界舞臺[MP][平衡板](Y)
++R6OE78 = 汽車總動員 奧拉瑪大獎賽(美)
++R6OP78 = 賽車總動員 競速(歐)
++R6OX78 = 賽車總動員 競速(X)
++R6QE69 = 我的模擬人生 特工(美)
++R6TEA4 = 龍卷風爆發(美)
++R6TPA4 = 龍卷風爆發(歐)
++R6VE4Z = 俱樂部之王(美)
++R6VPGN = 俱樂部之王(歐)
++R6WE68 = AMF保齡球世界(美)
++R6WP68 = AMF保齡球世界(歐)
++R6XE69 = 家庭游戲之夜(美)
++R6XP69 = 家庭游戲之夜(歐)
++R6YEXS = 橡皮球聚會(美)
++R6YPH3 = 橡皮球聚會(歐)
++R72E5G = 蛋糕工坊 混合(美)
++R72P5G = 蛋糕工坊 混合[WiFi](歐)
++R74E20 = 商場射擊館(美)
++R75E20 = 夢幻沙龍(美)
++R76E54 = NBA 2010[WiFi](美)
++R76P54 = NBA 2010[WiFi](歐)
++R77JAF = SD高達G世紀 戰爭(日)
++R79JAF = 機動戰士高達 MS戰線0079(日)
++R7AE69 = 模擬動物 非洲(美)
++R7AJ13 = 模擬動物 非洲(日)
++R7AP69 = 模擬動物 非洲(歐)
++R7BE20 = 吉利貝利 彈道豆(美)
++R7BP7J = 吉利貝利 彈道豆(歐)
++R7CJ01 = 彩虹隊長(日)
++R7CP01 = 彩虹隊長(歐)
++R7EE8P = 夢精靈 星降夜物語[WiFi](美)
++R7EJ8P = 夢精靈 星降夜物語[WiFi](日)
++R7EP8P = 夢精靈 星降夜物語[WiFi](歐)
++R7FEGD = 陸行鳥 忘卻時間的迷宮[WiFi](美)
++R7FJGD = 陸行鳥 忘卻時間的迷宮[WiFi](日)
++R7FPGD = 陸行鳥 忘卻時間的迷宮[WiFi](歐)
++R7GEAF = 龍珠 天下第一大冒險(美)
++R7GJAF = 龍珠 天下第一大冒險(日)
++R7GPAF = 龍珠 天下第一大冒險(歐)
++R7HE6K = 救兵總動員(美)
++R7IE69 = 魅力女孩俱樂部[平衡板](美)
++R7IP69 = 魅力女孩俱樂部 睡衣派對[平衡板](歐)
++R7KE6K = 巖石疾風(美)
++R7LP7J = 瑪格的困惑!(歐)
++R7MXFR = 音樂派對 轟動全場(歐)
++R7NE20 = 酷圣石 冰激凌來一勺(美)
++R7OE54 = 北美冰球聯盟2010[MP][WiFi](美)
++R7OP54 = 北美冰球聯盟2010[MP][WiFi](歐)
++R7PE01 = 拳王爭霸[平衡板](美)
++R7PJ01 = 拳王爭霸[平衡板](日)
++R7PP01 = 拳王爭霸[平衡板](歐)
++R7QE52 = 混沌影子武士(美)
++R7RE52 = 小聯盟世界錦標賽2009(美)
++R7SE5G = 逃出博物館(美)
++R7SP5G = 逃出博物館(歐)
++R7TFJW = 法式滾球(法)
++R7WE52 = 雪山運動[平衡板](美)
++R7WP52 = 雪山運動[平衡板](歐)
++R7XE69 = 極品飛車 氮氣(美)
++R7XJ13 = 極品飛車 氮氣(日)
++R7XP69 = 極品飛車 氮氣(歐)
++R7YFMR = 北京快車(法)
++R7ZE41 = 團體淘汰賽(美)
++R7ZP41 = 淘汰派對(歐)
++R82E52 = 動物星球 獸醫(美)
++R82JG0 = 飛標Wii DX(日)
++R82P52 = 動物星球 獸醫(歐)
++R83EA4 = 流行音樂(美)
++R83JA4 = 流行音樂Wii(日)
++R83PA4 = 流行音樂(歐)
++R84EE9 = 牧場物語Wii 安穩之樹(美)
++R84J99 = 牧場物語Wii 安穩之樹(日)
++R84P99 = 牧場物語 濟世之樹(歐)
++R85EG9 = 秘密星期六 第五太陽之獸(美)
++R85PG9 = 秘密星期六 第五日之獸(歐)
++R86E20 = 夢之舞蹈啦啦隊[平衡板](美)
++R87EVN = 斯基度雪地車挑戰賽(美)
++R89JEL = 東京友好樂園2(日)
++R8AJ01 = 口袋妖怪樂園 皮卡丘大冒險(日)
++R8BE41 = 保姆派對[平衡板](美)
++R8BP41 = 保姆派對[平衡板](歐)
++R8CE20 = 夢之舞蹈啦啦隊[平衡板](美)
++R8FES5 = 快餐危機(美)
++R8FJHA = 匠餐廳大繁盛!(日)
++R8FPNP = 快餐狂(歐)
++R8GJC8 = GI騎師聯盟2008[平衡板][WiFi](日)
++R8GPC8 = GI騎師聯盟2008[平衡板][WiFi](歐)
++R8HE4Q = 漢娜 蒙塔娜 電影版(美)
++R8HP4Q = 漢娜 蒙塔娜 電影版(歐)
++R8HX4Q = 漢娜 蒙塔娜 電影版(X)
++R8HY4Q = 漢娜 蒙塔娜 電影版(Y)
++R8IE78 = 海綿寶寶 誠實還是正直(美)
++R8IP78 = 海綿寶寶 誠實還是正直(歐)
++R8KPKM = 街頭足球 尼科拉斯阿內爾卡(歐)
++R8LE20 = 爆裂小雞獵殺者(美)
++R8LP7J = 爆裂小雞獵殺者(歐)
++R8NJG0 = 日本棒球機構承認 擊球革命[MP](日)
++R8OE54 = 玲玲馬戲團[平衡板](美)
++R8PE01 = 超級紙片馬里奧(美)
++R8PJ01 = 超級紙片馬里奧(日)
++R8PK01 = 超級紙片馬里奧(韓)
++R8PP01 = 超級紙片馬里奧(歐)
++R8RP41 = 亞瑟與他的迷你王國2[平衡板](歐)
++R8SE41 = 假日體育(美)
++R8SP41 = 假日體育(歐)
++R8SX41 = 假日體育(X)
++R8TENR = 臺球巡回賽(美)
++R8UXMR = 阿迪波冒險記(X)
++R8VE41 = 拯救地球 野生動物獸醫(美)
++R8VP41 = 拯救地球 野生動物獸醫(歐)
++R8XE52 = 侏羅紀 獵物(美)
++R8YE52 = 卡貝拉獵人2010(美)
++R8ZE8P = 大師教你普拉提[平衡板](美)
++R92J01 = 用Wii玩皮克敏2(日)
++R92P01 = 用Wii玩皮克敏2(歐)
++R94PMR = 終極紅球挑戰賽(歐)
++R94XMR = 終極紅球挑戰賽(X)
++R96EAF = 風之克羅諾亞 幻影之門(美)
++R96JAF = 風之克羅諾亞 幻影之門(日)
++R96KAF = 風之克羅諾亞 幻影之門(韓)
++R96PAF = 風之克羅諾亞 幻影之門(歐)
++R97E9B = 家庭歡樂橄欖球(美)
++R9BPMT = 鮑勃工程隊 歡樂節慶(歐)
++R9CPMR = 我是明星 快放我走(歐)
++R9DE78 = 描繪生命 下一章(美)
++R9DP78 = 描繪生命 下一章(歐)
++R9EPNP = 修理派對(歐)
++R9FE36 = 一級方程式賽車2009(美)
++R9FJ36 = 一級方程式賽車2009(日)
++R9FP36 = 一級方程式賽車2009(歐)
++R9HE78 = 你比五年級生聰明嗎？(美)
++R9IE01 = 用Wii玩皮克敏(美)
++R9IJ01 = 用Wii玩皮克敏(日)
++R9IP01 = 用Wii玩皮克敏(歐)
++R9JE69 = 甲殼蟲 搖滾樂隊[WiFi](美)
++R9JP69 = 甲殼蟲 搖滾樂隊[WiFi](歐)
++R9KE20 = 律動方塊(美)
++R9LE41 = 通宵派對(美)
++R9LP41 = 女孩生活 通宵派對[平衡板](歐)
++R9ME5Z = 夏季運動會2009[平衡板](美)
++R9MPFR = 夏季運動會2009[平衡板](歐)
++R9NPMR = 家族財富(歐)
++R9OE69 = 泰格伍茲高爾夫巡回10[MP][WiFi](美)
++R9OK69 = 泰格伍茲高爾夫巡回10[MP][WiFi](韓)
++R9OP69 = 泰格伍茲高爾夫巡回10[MP][WiFi](歐)
++R9RPNG = 舞蹈派對 流行精選[跳舞毯](歐)
++R9SPPL = 球形數獨 偵探(歐)
++R9TE69 = 泰格伍茲高爾夫巡回09[WiFi](美)
++R9TJ13 = 泰格伍茲高爾夫巡回09[WiFi](日)
++R9TK69 = 泰格伍茲高爾夫巡回09[WiFi](韓)
++R9TP69 = 泰格伍茲高爾夫巡回09[WiFi](歐)
++R9UPGY = 熊熊工坊 友誼谷(歐)
++R9VE52 = 坎貝拉野外冒險2010(美)
++R9WPSP = WSC真實09世界斯諾克大獎賽(歐)
++R9XE52 = 街機地帶(美)
++R9XP52 = 街機地帶(歐)
++R9ZE54 = 職棒大聯盟2K9(美)
++R9ZP54 = 職棒大聯盟2K9(歐)
++RB2E6K = 氣球泡泡(美)
++RB2J2K = 氣球泡泡(日)
++RB2P6K = 氣球泡泡(歐)
++RB2PGT = 氣球泡泡(歐)
++RB4E08 = 生化危機4(美)
++RB4J08 = 生化危機4(日)
++RB4P08 = 生化危機4(歐)
++RB4X08 = 生化危機4(X)
++RB5E41 = 戰火兄弟連 雙重時間(美)
++RB5P41 = 戰火兄弟連 雙重時間(歐)
++RB6J18 = 炸彈人大陸[WiFi](日)
++RB7E54 = 惡霸魯尼 學院風云(美)
++RB7P54 = 惡霸魯尼 學院風云(歐)
++RB8E70 = 后院棒球09(美)
++RB9D78 = 布拉茲娃娃電影版(德)
++RB9E78 = 布拉茲娃娃電影版(美)
++RB9P78 = 布拉茲娃娃電影版(歐)
++RBAE41 = 熾天使 二戰空騎兵(美)
++RBAP41 = 熾天使 二戰空騎兵(歐)
++RBBE18 = 炸彈人樂園(美)
++RBBJ18 = 炸彈人樂園(日)
++RBBP99 = 炸彈人樂園(歐)
++RBCP41 = 電視迷(歐)
++RBEE52 = 蜜蜂總動員(美)
++RBEP52 = 蜜蜂總動員(歐)
++RBEX52 = 蜜蜂總動員(X)
++RBFE20 = 乒乓特種兵(美)
++RBFP20 = 乒乓特種兵(歐)
++RBFP7J = 乒乓特種兵(歐)
++RBGE54 = 職業棒球聯賽(美)
++RBGP54 = 職業棒球聯賽(歐)
++RBHE08 = 生化危機0(美)
++RBHJ08 = 生化危機0(日)
++RBHP08 = 生化危機0(歐)
++RBIEE9 = 牧場物語 歡欣雀躍的動物進行曲(美)
++RBIJ99 = 牧場物語 歡樂動物進行曲(日)
++RBKE69 = 轟炸方塊[WiFi](美)
++RBKJ13 = 轟炸方塊(日)
++RBKK69 = 轟炸方塊(韓)
++RBKP69 = 轟炸方塊(歐)
++RBLE8P = 死神 白刃閃耀圓舞曲(美)
++RBLJ8P = 死神 白刃閃耀圓舞曲(日)
++RBLP8P = 死神 白刃閃耀圓舞曲(歐)
++RBME5G = 泡泡龍(美)
++RBMPGT = 泡泡龍(歐)
++RBNEG9 = Ben 10 守護地球(美)
++RBNPG9 = Ben 10 守護地球(歐)
++RBNXG9 = Ben 10 守護地球(X)
++RBOE69 = 布吉搖擺(美)
++RBOP69 = 布吉搖擺(歐)
++RBPE4Z = 布倫瑞克職業保齡球(美)
++RBPP4Z = 布倫瑞克職業保齡球(歐)
++RBPPGT = 布倫瑞克職業保齡球(歐)
++RBQENR = 經典英式賽車(美)
++RBQPUG = 經典英式賽車(歐)
++RBRE5G = 轟炸使命[WiFi](美)
++RBRP5G = 轟炸使命[WiFi](歐)
++RBRX5G = 轟炸作業 建造 融化 摧毀(歐)
++RBSJ08 = 戰國BASARA2 英雄外傳(日)
++RBTE8P = 釣魚高手(美)
++RBTJ8P = 釣魚高手(日)
++RBTP8P = 釣魚高手(歐)
++RBUE08 = 生化危機 安布雷拉歷代記(美)
++RBUJ08 = 生化危機 安布雷拉歷代記(日)
++RBUK08 = 生化危機 安布雷拉歷代記(韓)
++RBUP08 = 生化危機 安布雷拉歷代記(歐)
++RBVE52 = 芭比 森林公主(美)
++RBVP52 = 芭比 森林公主(歐)
++RBWE01 = 軍隊戰爭2[WiFi](美)
++RBWJ01 = 軍隊戰爭2[WiFi](日)
++RBWP01 = 軍隊戰爭2[WiFi](歐)
++RBXJ8P = BLEACH死神 對決十刃[WiFi](日)
++RBYE78 = 瘋狂農莊(美)
++RBYJ78 = 瘋狂農莊(日)
++RBYP78 = 瘋狂農莊(歐)
++RBZE5Z = 巫師比利 火箭掃帚大競速(美)
++RBZP5Z = 巫師比利 火箭掃帚大競速(歐)
++RBZPUG = 巫師比利 火箭掃帚大競速(歐)
++RBZXUG = 巫師比利 火箭掃帚大競速(X)
++RC2E78 = 汽車總動員 全國汽車大賽(美)
++RC2P78 = 汽車總動員 全國汽車大賽(歐)
++RC2X78 = 汽車總動員 全國汽車大賽(X)
++RC2Y78 = 汽車總動員 全國汽車大賽(Y)
++RC3E41 = 模擬寵物貓2(美)
++RC3J41 = 模擬寵物貓2(日)
++RC3P41 = 模擬寵物貓2(歐)
++RC3X41 = 模擬寵物貓2(X)
++RC4JD9 = 蠟筆小新 最強家族春日部之王(日)
++RC4SGT = 蠟筆小新 最強家族春日部之王(西)
++RC5JDQ = 掃除戰隊(日)
++RC7E20 = 與海怪同行 史前探險(美)
++RC7P7J = 與海怪同行 史前探險(歐)
++RC8E7D = 古惑狼 變異心靈(美)
++RC8P7D = 古惑狼 變異心靈(歐)
++RC8X7D = 古惑狼 變異心靈(X)
++RC9PGN = 人偶CID(歐)
++RCAE78 = 汽車總動員(美)
++RCAJ78 = 汽車總動員(日)
++RCAP78 = 汽車總動員(歐)
++RCAX78 = 汽車總動員(X)
++RCAY78 = 汽車總動員(Y)
++RCBE52 = 坎貝拉獵人(美)
++RCBP52 = 坎貝拉獵人(歐)
++RCCE5G = 料理媽媽(美)
++RCCJC0 = 料理媽媽(日)
++RCCPGT = 料理媽媽(歐)
++RCDD52 = 使命召喚3(德)
++RCDE52 = 使命召喚3(美)
++RCDP52 = 使命召喚3(歐)
++RCDX52 = 使命召喚3(X)
++RCEE5Z = 迷你模型賽車(美)
++RCEPUG = 迷你模型賽車(歐)
++RCEXUG = 迷你模型賽車(X)
++RCFE41 = 宇宙家庭(美)
++RCFP41 = 宇宙家庭(歐)
++RCGE54 = 游戲狂歡節 迷你高爾夫(美)
++RCGP54 = 游戲狂歡節 迷你高爾夫(歐)
++RCHEAF = 大家的啦啦隊(美)
++RCHJAF = 大家的啦啦隊(日)
++RCHPAF = 大家的啦啦隊(歐)
++RCHPGT = 大家的啦啦隊(歐)
++RCIE41 = 犯罪現場調查 鐵證如山(美)
++RCIP41 = 犯罪現場調查 鐵證如山(歐)
++RCJE8P = 管道[WiFi](美)
++RCJP8P = 管道[WiFi](歐)
++RCKPGN = 阿倫·漢森的運動挑戰(歐)
++RCLE4Q = 四眼天雞之動作天王(美)
++RCLP4Q = 四眼天雞之動作天王(歐)
++RCOJ99 = 名偵探柯南 追憶的幻想(日)
++RCOPNP = 名偵探柯南 追憶的幻想(歐)
++RCPE18 = 穿越迷路(美)
++RCPJ18 = 穿越迷路(日)
++RCPP18 = 穿越迷路(歐)
++RCQEDA = Q版賽車 Wii(美)
++RCQJDA = Q版賽車 Wii(日)
++RCRE5D = 勁速狂飆(美)
++RCRP5D = 勁速狂飆(歐)
++RCSE20 = 射雞英雄傳(美)
++RCSP20 = 射雞英雄傳(歐)
++RCSP7J = 射雞英雄傳(歐)
++RCTE5Z = 反擊力量(美)
++RCTP5Z = 反擊力量(歐)
++RCTPGT = 反擊力量(歐)
++RCUE52 = 卡貝拉傳奇冒險(美)
++RCUP52 = 卡貝拉傳奇冒險(歐)
++RCVE41 = 孤島驚魂 復仇(美)
++RCVP41 = 孤島驚魂 復仇(歐)
++RCXE78 = 全明星拉拉隊[平衡板](美)
++RCXP78 = 全明星拉拉隊[平衡板](歐)
++RCYPGN = 切格的聚會迷題(歐)
++RD2E41 = 赤鐵2[MP](美)
++RD2P41 = 赤鋼鐵2(歐)
++RD2X41 = 赤鐵2[MP](X)
++RD4EA4 = 勁舞革命 勁爆舞會2[跳舞毯](美)
++RD4JA4 = 勁舞革命 勁爆舞會2[跳舞毯](日)
++RD4PA4 = 勁舞革命 勁爆舞會2[跳舞毯](歐)
++RD6EE9 = 動物王國 野生動物探索(美)
++RD6J8N = 動物奇想天外！在謎之樂園攝影(日)
++RD6PNP = 動物奇想天外！在謎之樂園攝影(歐)
++RD8E52 = 與星共舞[跳舞毯](美)
++RD9J18 = 解謎系列Vol.1 數獨(日)
++RDAE52 = 與星共舞 一起跳[跳舞毯](美)
++RDBE70 = 龍珠Z 電光火石 2(美)
++RDBJAF = 龍珠Z 電光火石 2(日)
++RDBP70 = 龍珠Z 電光火石 2(歐)
++RDBPAF = 龍珠Z 電光火石 2(歐)
++RDCE78 = 致命生物(美)
++RDCP78 = 致命生物(歐)
++RDDEA4 = 熱舞革命 勁爆舞會[跳舞毯](美)
++RDDJA4 = 熱舞革命 勁爆舞會[跳舞毯](日)
++RDDPA4 = 熱舞革命 勁爆舞會[跳舞毯](歐)
++RDEJ0A = 全日本貨柜車祭典(日)
++RDFE41 = 肖恩懷特滑雪板[平衡板](美)
++RDFP41 = 肖恩懷特滑雪板[平衡板](歐)
++RDGEA4 = 惡魔城 審判[WiFi](美)
++RDGJA4 = 惡魔城 審判[WiFi](日)
++RDGPA4 = 惡魔城 審判[WiFi](歐)
++RDHE78 = 毀滅全人類 解放威廉(美)
++RDHP78 = 毀滅全人類 解放威廉(歐)
++RDIE41 = 寵物狗樂園(美)
++RDIJG2 = 寵物狗樂園(日)
++RDIP41 = 寵物狗樂園(歐)
++RDJE4F = 小死神 邪惡的根源(美)
++RDJP4F = 小死神 邪惡的根源(歐)
++RDKE01 = 大金剛 木桶噴射(美)
++RDKJ01 = 大金剛 木桶噴射(日)
++RDKP01 = 大金剛 木桶噴射(歐)
++RDLE5G = 狐貍偵探智救人質(美)
++RDLP70 = 狐貍偵探智救人質(歐)
++RDME6K = 米儂向前沖(美)
++RDMJ8N = 米儂向前沖(日)
++RDMPHZ = 每日英雄 米儂(歐)
++RDNEA4 = 勁舞革命 開心迪士尼[跳舞毯](美)
++RDOE41 = 模擬寵物狗2(美)
++RDOJ41 = 模擬寵物狗2(日)
++RDOP41 = 模擬寵物狗2(歐)
++RDOX41 = 模擬寵物狗2(X)
++RDPE54 = 探險家多拉 拯救雪公主(美)
++RDPP54 = 探險家多拉 拯救雪公主(歐)
++RDPX54 = 探險家多拉 拯救雪公主(X)
++RDQEGD = 勇者斗惡龍 假面女王(美)
++RDQJGD = 勇者斗惡龍 假面女王(日)
++RDQPGD = 勇者斗惡龍 假面女王(歐)
++RDREA4 = 水精迪依大冒險(美)
++RDRJA4 = 水精迪依大冒險(日)
++RDRPA4 = 水精迪依大冒險(歐)
++RDSA-- = 龍珠Z 電光火石 3[WiFi](A)
++RDSE70 = 龍珠Z 電光火石 3[WiFi](美)
++RDSJAF = 龍珠Z 電光火石 3[WiFi](日)
++RDSPAF = 龍珠Z 電光火石 3[WiFi](歐)
++RDTEAF = 電子雞寵物店(美)
++RDTJAF = 電子雞寵物店(日)
++RDTPAF = 電子雞寵物店(歐)
++RDUJDQ = 陸官編年史左手骰子右手劍[WiFi](日)
++RDVE41 = 橫沖直撞之平行線(美)
++RDVP41 = 橫沖直撞之平行線(歐)
++RDWEG9 = 龍刃 怒火燃燒(美)
++RDWJG9 = 龍刃 怒火燃燒(日)
++RDWPG9 = 龍刃 怒火燃燒(歐)
++RDXE18 = 德卡運動會(美)
++RDXJ18 = 德卡運動會(日)
++RDXKA4 = 德卡運動會(韓)
++RDXP18 = 德卡運動會(歐)
++RDYEGN = 人偶CID(美)
++RDZE01 = 天災 危機之日(美)
++RDZJ01 = 天災 危機之日(日)
++RDZP01 = 天災 危機之日(歐)
++RE3ENR = 空戰高手 二戰英雄(美)
++RE3PNR = 空戰高手 二戰英雄(歐)
++RE4E08 = 生化危機(美)
++RE4J08 = 生化危機(日)
++RE4P08 = 生化危機(歐)
++RE5PAF = 大胃王(歐)
++RE7PNK = 狩獵挑戰(歐)
++RE8J99 = 家庭教師 禁斷的暗之三角[WiFi](日)
++REAE69 = 名人體育(美)
++REAF69 = 名人體育(法)
++REAP69 = 名人體育(歐)
++REBPMT = 憨豆先生的古怪世界(歐)
++RECE6K = 間諜游戲 電梯任務(美)
++RECP6K = 間諜游戲 電梯任務(歐)
++REDA41 = 赤鐵(A)
++REDE41 = 赤鐵(美)
++REDJ41 = 赤鐵(日)
++REDP41 = 赤鐵(歐)
++REFP41 = 我的法語教練(歐)
++REGE36 = 緊急出動(美)
++REGP36 = 緊急出動(歐)
++REHE41 = 緊急英雄(美)
++REHP41 = 緊急英雄(歐)
++REJEAF = 活力生活 極限挑戰(美)
++REJJAF = 家庭教練2[跳舞毯](日)
++REJPAF = 活力生活 極限挑戰[跳舞毯](歐)
++REKE41 = 金牌吉姆卡迪歐塑身[平衡板](美)
++REKJ2N = 有氧拳擊 Wii快樂瘦身[平衡板](日)
++REKP41 = 金牌吉姆卡迪歐塑身[平衡板](歐)
++REKU41 = 我的健康教練 金牌吉姆卡迪歐塑身[平衡板](英)
++RELEA4 = 能源小精靈(美)
++RELJA4 = 能源小精靈(日)
++RELKA4 = 能源小精靈(韓)
++RELPA4 = 能源小精靈(歐)
++REMJ8P = 哆啦A夢Wii 秘密道具王決定戰！(日)
++RENE8P = 索尼克與黑暗騎士[WiFi](美)
++RENJ8P = 索尼克與黑暗騎士[WiFi](日)
++RENP8P = 索尼克與黑暗騎士[WiFi](歐)
++REQE54 = 徒步旅行搶救隊(美)
++REQP54 = 徒步旅行搶救隊(歐)
++REQX54 = 徒步旅行搶救隊(X)
++REQY54 = 野生動物救援隊(Y)
++RESE41 = 我的西班牙語教練(美)
++RESP41 = 我的西班牙語教練(歐)
++RETJAF = 廟會達人(日)
++REUPNK = 我的形體教練(歐)
++REVJ8P = 忌火起草 解明篇(日)
++REVJBP = 忌火起草 解明篇(日)
++REWFMR = 我的馬匹俱樂部(法)
++REWXMR = 我的馬匹俱樂部(X)
++REWYMR = 我的馬匹俱樂部(Y)
++REXE01 = 瘋狂卡車(美)
++REXJ01 = 瘋狂卡車(日)
++REXP01 = 瘋狂卡車(歐)
++REYE4Q = 迪士尼 想唱就唱 歌舞青春3畢業季(美)
++REYP4Q = 迪士尼 想唱就唱 歌舞青春3畢業季(歐)
++REZEJJ = 西洋棋高手(美)
++REZPKM = 西洋棋高手(歐)
++RF2E54 = 神奇四俠 神奇四俠與銀影俠(美)
++RF2P54 = 神奇四俠 神奇四俠與銀影俠(歐)
++RF3E52 = 法拉利挑戰賽(美)
++RF3P6M = 法拉利挑戰賽(歐)
++RF4P6M = 超級水果瀑布(歐)
++RF7J08 = 龍之子對卡普空(日)
++RF8E69 = FIFA足球08[WiFi](美)
++RF8J13 = FIFA足球08[WiFi](日)
++RF8K69 = FIFA足球08[WiFi](韓)
++RF8P69 = FIFA足球08[WiFi](歐)
++RF8X69 = FIFA足球08[WiFi](X)
++RF8Y69 = FIFA足球08[WiFi](Y)
++RF9E69 = FIFA足球09[WiFi](美)
++RF9J13 = FIFA足球09[WiFi](日)
++RF9K69 = FIFA足球09[WiFi](韓)
++RF9P69 = FIFA足球09[WiFi](歐)
++RF9X69 = FIFA足球09[WiFi](X)
++RF9Y69 = FIFA足球09[WiFi](Y)
++RFAEAF = 生命運動 戶外挑戰[跳舞毯](美)
++RFAJAF = 家庭教練 體育世界(日)
++RFAPAF = 家庭教練[跳舞毯](歐)
++RFBE01 = 永恒蔚藍[WiFi](美)
++RFBJ01 = 永恒蔚藍[WiFi](日)
++RFBP01 = 永恒蔚藍[WiFi](歐)
++RFCEGD = 最終幻想水晶編年史 水晶守護者(美)
++RFCJGD = 最終幻想水晶編年史 水晶守護者(日)
++RFCPGD = 最終幻想水晶編年史 水晶守護者(歐)
++RFEE01 = 火炎紋章 曉之女神(美)
++RFEJ01 = 火炎紋章 曉之女神(日)
++RFEP01 = 火炎紋章 曉之女神(歐)
++RFFEGD = 水晶編年史 時之回聲[WiFi](美)
++RFFJGD = 水晶編年史 時之回聲[WiFi](日)
++RFFPGD = 水晶編年史 時之回聲[WiFi](歐)
++RFJJAF = 家庭賽馬(日)
++RFKE41 = 我的健康教練(美)
++RFKJ41 = 我的健康教練(日)
++RFKP41 = 我的健康教練(歐)
++RFKX41 = 我的健康教練(X)
++RFLE69 = 美式橄欖球大聯盟09[WiFi](美)
++RFLP69 = 美式橄欖球大聯盟09[WiFi](歐)
++RFLPWK = 美式橄欖球大聯盟09[WiFi](歐)
++RFMJAF = 職棒家庭棒球場[WiFi](日)
++RFNE01 = Wii健身[平衡板](美)
++RFNJ01 = Wii健身[平衡板](日)
++RFNK01 = Wii健身[平衡板](韓)
++RFNP01 = Wii健身[平衡板](歐)
++RFNW01 = Wii健身[平衡板](中)
++RFOE52 = 蜘蛛俠 敵友難辨(美)
++RFOP52 = 蜘蛛俠 敵友難辨(歐)
++RFOX52 = 蜘蛛俠 敵友難辨(X)
++RFPE01 = Wii健身加強版[平衡板](美)
++RFPJ01 = Wii健身加強版[平衡板](日)
++RFPP01 = Wii健身加強版[平衡板](歐)
++RFPR01 = Wii健身加強版[平衡板](俄)
++RFPW01 = Wii健身加強版[平衡板](中)
++RFQE69 = 破相拳擊(美)
++RFQJ13 = 破相拳擊(日)
++RFQJ69 = 破相拳擊(日)
++RFQK69 = 破相拳擊(韓)
++RFQP69 = 破相拳擊(歐)
++RFRE5G = 搖擺回轉公園(美)
++RFRJC0 = 搖擺回轉公園(日)
++RFSEEB = 風塵英雄(美)
++RFSJ8P = 迷宮 風塵英雄3機關屋沉睡公主(日)
++RFTE70 = 后院橄欖球(美)
++RFTP70 = 后院橄欖球(歐)
++RFUJA4 = 麻將格斗俱樂部Wii[WiFi](日)
++RFVE52 = 淘氣小猴 聚會時間(美)
++RFVP52 = 淘氣小猴 聚會時間(歐)
++RFWE5Z = 野外探險 非洲(美)
++RFWPNK = 非洲徒步大冒險(歐)
++RFYFMR = 博涯堡壘 開戰(法)
++RFZE41 = 想象 時尚聚會[平衡板](美)
++RFZP41 = 想象 時尚偶像[平衡板](歐)
++RG2EXS = 罪惡裝備XX(美)
++RG2JJF = 罪惡裝備XX(日)
++RG2PGT = 罪惡裝備XX(歐)
++RG2PXS = 罪惡裝備XX(歐)
++RG4JC0 = 電車Go！新干線EX 山陽新干線(日)
++RG5EWR = 吉尼斯世界紀錄 電視游戲[WiFi](美)
++RG5PWR = 吉尼斯世界紀錄 電視游戲[WiFi](歐)
++RG6E69 = 搖滾樂超級明星(美)
++RG6P69 = 搖滾樂超級明星(歐)
++RG8E41 = 寵物體育 狗狗競技場(美)
++RG8P41 = 寵物體育 狗狗競技場(歐)
++RG9E54 = 嘉年華游戲 迷你高爾夫(美)
++RG9P54 = 嘉年華游戲 迷你高爾夫(歐)
++RGAE8P = 51號星球(美)
++RGAP8P = 51號星球(歐)
++RGBE08 = 哈維博德曼 律師(美)
++RGBP08 = 哈維博德曼 律師(歐)
++RGCEXS = 遙控直升機Wii 飛行大冒險(美)
++RGCJJF = 遙控直升機Wii 飛行大冒險(日)
++RGCPGT = 遙控直升機Wii 飛行大冒險(歐)
++RGCS52 = 自制 吉他英雄3 下載版(西)
++RGDEA4 = 恐怖行動(美)
++RGDPA4 = 恐怖行動(歐)
++RGEJJ9 = 世界黃金蛋節奏合拍系日本的音符(日)
++RGFE69 = 教父 黑手黨(美)
++RGFF69 = 教父 黑手黨(法)
++RGFI69 = 教父 黑手黨(意)
++RGFP69 = 教父 黑手黨(歐)
++RGFS69 = 教父 黑手黨(西)
++RGGJAF = GeGeGe的鬼太郎 妖怪大運動會(日)
++RGHC20 = 自制 吉他英雄3 下載版(歐)
++RGHE52 = 吉他英雄3 搖滾傳奇[WiFi](美)
++RGHE61 = 自制 吉他英雄3 下載版(美)
++RGHE62 = 自制 吉他英雄3 下載版(美)
++RGHEMR = 自制 吉他英雄3 下載版(美)
++RGHJ52 = 吉他英雄3 搖滾傳奇[WiFi](日)
++RGHK52 = 吉他英雄3 搖滾傳奇[WiFi](韓)
++RGHP52 = 吉他英雄3 搖滾傳奇[WiFi](歐)
++RGHPOH = 自制 唱吧 下載版(歐)
++RGHPS2 = 自制 吉他英雄3 下載版(歐)
++RGIJC8 = G1騎師Wii 2008[平衡板](日)
++RGIPC8 = G1騎師Wii 2008[平衡板](歐)
++RGJE4Z = 森林泰山 探秘(美)
++RGJP7U = 森林泰山 探秘(歐)
++RGKENR = 國際兒童 瘋狂高爾夫(美)
++RGKPNR = 國際兒童 瘋狂高爾夫(歐)
++RGLE7D = 幾何戰爭 銀河[WiFi](美)
++RGLP7D = 幾何戰爭 銀河[WiFi](歐)
++RGME5D = 企鵝也瘋狂(美)
++RGMP5D = 企鵝也瘋狂(歐)
++RGNJAF = 銀魂(日)
++RGOJJ9 = 金蛋世界(日)
++RGPJAF = 機動戰士高達2 哀.戰士篇(日)
++RGQE70 = 捉鬼敢死隊(美)
++RGQP70 = 捉鬼敢死隊(歐)
++RGSE8P = 幽靈小隊[WiFi](美)
++RGSJ8P = 幽靈小隊[WiFi](日)
++RGSP8P = 幽靈小隊[WiFi](歐)
++RGTE41 = GT職業賽車(美)
++RGTJBL = GT職業賽車(日)
++RGTP41 = GT職業賽車(歐)
++RGVE52 = 吉他英雄 空中鐵匠樂隊專輯[WiFi](美)
++RGVJ52 = 吉他英雄 空中鐵匠樂隊專輯[WiFi](日)
++RGVP52 = 吉他英雄 空中鐵匠樂隊專輯[WiFi](歐)
++RGWE41 = 瘋狂兔子 回家[WiFi](美)
++RGWJ41 = 瘋狂兔子 回家[WiFi](日)
++RGWP41 = 瘋狂兔子 回家[WiFi](歐)
++RGWX41 = 瘋狂兔子 回家[WiFi](X)
++RGXE5D = 游戲派對(美)
++RGXP5D = 游戲派對(歐)
++RGYE5Z = 美女卡丁車(美)
++RGYPUG = 美女卡丁車(歐)
++RGZE52 = 哥斯拉能量釋放(美)
++RGZE70 = 哥斯拉能量釋放(美)
++RGZP70 = 哥斯拉能量釋放(歐)
++RH2E41 = 地獄廚房(美)
++RH2P41 = 地獄廚房(歐)
++RH3E4Q = 歌舞青春3 畢業舞會(美)
++RH3J4Q = 歌舞青春3 畢業舞會(日)
++RH3P4Q = 歌舞青春3 畢業舞會(歐)
++RH4XUG = 倉鼠英雄(X)
++RH5EVN = 小馬生活冒險[WiFi](美)
++RH5PKM = 愛倫懷塔克的小馬生活(歐)
++RH6E69 = 哈里波特與混血王子(美)
++RH6P69 = 哈里波特與混血王子(歐)
++RH7J8P = Sammy合集 北斗神拳[WiFi](日)
++RH8E4F = 古墓麗影 地下世界(美)
++RH8JEL = 古墓麗影 地下世界(日)
++RH8P4F = 古墓麗影 地下世界(歐)
++RH8X4F = 古墓麗影 地下世界(X)
++RH9JC8 = 遙遠時空4[WiFi](日)
++RHAE01 = Wii第一次接觸(美)
++RHAJ01 = Wii第一次接觸(日)
++RHAK01 = Wii第一次接觸(韓)
++RHAP01 = Wii第一次接觸(歐)
++RHAW01 = Wii第一次接觸(中)
++RHCE52 = 歷史頻道 太平洋戰爭(美)
++RHCP52 = 歷史頻道 太平洋戰爭(歐)
++RHD222 = 自制 死亡之屋2(自)
++RHD333 = 自制 死亡之屋3(自)
++RHDE8P = 死亡之屋2+3(美)
++RHDJ8P = 死亡之屋2+3(日)
++RHDP8P = 死亡之屋2+3(歐)
++RHEEJJ = 海因茲沃爾夫教授的重力挑戰(美)
++RHEPKM = 海因茲沃爾夫教授的重力挑戰(歐)
++RHFE5D = 快樂大腳(美)
++RHFP5D = 快樂大腳(歐)
++RHGP6Z = 特工雨果 檸檬榨汁(歐)
++RHGX6Z = 特工雨果 檸檬榨汁(X)
++RHHJ8J = 涼宮春日的激動(日)
++RHIEXJ = 第一神拳 革命(美)
++RHIJ41 = 第一神拳 革命(日)
++RHIJJ9 = 第一神拳 革命(日)
++RHIP41 = 第一神拳 革命(歐)
++RHJJ13 = 銀星桌面游戲(日)
++RHKE18 = 工作狂(美)
++RHKJ18 = 工作狂(日)
++RHKP18 = 工作狂(歐)
++RHLE4Z = 世界錦標紙牌賽(美)
++RHLPGT = 世界錦標紙牌賽(歐)
++RHMEE9 = 牧場物語(美)
++RHMP99 = 牧場物語(歐)
++RHNE70 = 馬兒與我(美)
++RHNP70 = 馬兒與我(歐)
++RHOE8P = 死亡之屋 過度殺戮(美)
++RHOJ8P = 死亡之屋 過度殺戮(日)
++RHOP8P = 死亡之屋 過度殺戮(歐)
++RHPJ8N = 欺詐流浪記(日)
++RHQE4Q = 漢娜蒙塔娜 聚光燈下的世界巡演(美)
++RHQP4Q = 漢娜蒙塔娜 聚光燈下的世界巡演(歐)
++RHQX4Q = 孟漢娜萬眾矚目全球巡演歌唱大賽(歐)
++RHQY4Q = 孟漢娜萬眾矚目全球巡演歌唱大賽(Y)
++RHRJ99 = 家庭教師HITMAN！夢之超級戰斗！(日)
++RHSE36 = 熱導追蹤(美)
++RHSP36 = 熱導追蹤(歐)
++RHSX36 = 熱導追蹤(X)
++RHSY36 = 熱導追蹤(Y)
++RHTE54 = 俠盜獵魔2(美)
++RHTP54 = 俠盜獵魔2(歐)
++RHUE20 = 輪滑城市英雄[平衡板](美)
++RHUP20 = 輪滑城市英雄[平衡板](歐)
++RHUP7J = 輪滑城市英雄[平衡板](歐)
++RHVE5Z = 瘋狂小雞傳說(美)
++RHVPFR = 瘋狂小雞傳說(歐)
++RHWE52 = 熱輪競速(美)
++RHWP52 = 熱輪競速(歐)
++RHXE78 = 樂隊大戰(美)
++RHXP78 = 樂隊大戰(歐)
++RHYJAF = 跳躍之門Wii 極限挑戰(日)
++RHZE41 = 模擬寵物馬2(美)
++RHZP41 = 模擬寵物馬2(歐)
++RI1POH = 自制 唱吧 下載版(歐)
++RI2E4Q = 迪斯尼 想唱就唱 高校音樂劇(美)
++RI2P4Q = 迪斯尼 想唱就唱 高校音樂劇(歐)
++RI2POH = 自制 唱吧 下載版(歐)
++RI3E5D = 別惹螞蟻(美)
++RI3P5D = 別惹螞蟻(歐)
++RI3POH = 自制 唱吧 下載版(歐)
++RI6ENR = 夏季運動會2 小島運動會(美)
++RI6P41 = 夏季運動聚會(歐)
++RI7E4Z = 怪物大破壞 創建和戰斗(美)
++RI8E41 = 戰火兄弟連 雙重時間(美)
++RI8P41 = 戰火兄弟連 雙重時間(歐)
++RI9EGT = 天后女孩 冰上公主[平衡板](美)
++RI9PGT = 天后女孩 冰上公主[平衡板](歐)
++RIAE52 = 冰河世紀3 恐龍的黎明(美)
++RIAI52 = 冰河世紀3 恐龍的黎明(意)
++RIAP52 = 冰河世紀3 恐龍的黎明(歐)
++RIBES5 = 科學小怪蛋(美)
++RIBPKM = 科學小怪蛋(歐)
++RICENR = 美國鐵人料理 頂級烹飪法(美)
++RIDE20 = 微笑世界島嶼挑戰(美)
++RIDP7J = 微笑的世界島嶼挑戰(歐)
++RIEEA4 = 卡拉OK革命 美國偶像 再次演唱(美)
++RIEPA4 = 卡拉OK革命 美國偶像 再次演唱(歐)
++RIFEA4 = 卡拉OK革命 美國偶像 再次演唱2(美)
++RIGE54 = 徒步旅行救助隊 恐龍大拯救(美)
++RIGP54 = 徒步旅行救助隊 恐龍大拯救(歐)
++RIHE8P = 無敵綠巨人(美)
++RIHP8P = 無敵綠巨人(歐)
++RIIPNG = 卡丁賽車手(歐)
++RIJE69 = 特種部隊 眼鏡蛇危機(美)
++RIJP69 = 特種部隊 眼鏡蛇危機(歐)
++RIKPNG = 卡車賽車手(歐)
++RILJ18 = PUZ系列2 插畫邏輯+色彩邏輯(日)
++RIME36 = 碟中諜(美)
++RIMP6M = 碟中諜(歐)
++RINE08 = 喪尸圍城 僵尸的祭品(美)
++RINJ08 = 喪尸圍城 僵尸的祭品(日)
++RINP08 = 喪尸圍城 僵尸的祭品(歐)
++RIOPSU = 恐怖歷史之殘忍羅馬(歐)
++RIPEAF = 海賊王 終極冒險(美)
++RIPJAF = 海賊王 終極冒險(日)
++RIPPAF = 海賊王 終極冒險(歐)
++RIRE8P = 鋼鐵俠(美)
++RIRP8P = 鋼鐵俠(歐)
++RITFMR = 城市之間[平衡板](法)
++RIUJAF = 海賊王 無盡冒險EP2 勇者的覺醒(日)
++RIUPAF = 海賊王 無盡冒險EP2 勇者的覺醒(歐)
++RIWENR = 漢堡島(美)
++RIXE20 = 道奇賽車 掌控者與挑戰者(美)
++RIYE52 = 太空營地(美)
++RIYP52 = 太空營地(歐)
++RIZENR = 印第500賽車(美)
++RJ2E52 = 詹姆斯邦德007 量子危機[WiFi](美)
++RJ2JGD = 詹姆斯邦德007 量子危機[WiFi](日)
++RJ2P52 = 詹姆斯邦德007 量子危機[WiFi](歐)
++RJ3E20 = 吉普越野賽車(美)
++RJ3P7J = 吉普越野賽車(歐)
++RJ4ENR = 珠寶大師 羅馬發源地(美)
++RJ4PRM = 珠寶大師 羅馬發源地(歐)
++RJ7FWP = 電視7游戲 法語填字游戲(法)
++RJ8E64 = 印第安納瓊斯與帝王手杖(美)
++RJ8P64 = 印第安納瓊斯與帝王手杖(歐)
++RJ9FMR = 思考 邏輯訓練(法)
++RJ9PFR = 思考 邏輯訓練(歐)
++RJ9XML = 思考 邏輯訓練(X)
++RJAD52 = 使命召喚 現代戰爭 反應能力[WiFi](德)
++RJAE52 = 使命召喚 現代戰爭 反應能力[WiFi](美)
++RJAP52 = 使命召喚 現代戰爭 反應能力[WiFi](歐)
++RJAX52 = 使命召喚 現代戰爭 反應能力[WiFi](X)
++RJBJAF = 大怪獸對決 超人力霸王競技場(日)
++RJCE52 = Baja 1000越野拉力賽(美)
++RJCP52 = Baja 1000越野拉力賽(歐)
++RJDPKM = 我的動物中心(歐)
++RJEE70 = 層層疊世界巡回賽(美)
++RJEP70 = 層層疊世界巡回賽(歐)
++RJFE5G = 吉利安麥克爾健身訓練09[平衡板](美)
++RJFP5G = 吉利安麥克爾健身訓練09[平衡板](歐)
++RJFPKM = 吉利安麥克爾健身訓練09[平衡板](歐)
++RJGJDA = 人生游戲(日)
++RJHE52 = 馬達加斯加賽車(美)
++RJHP52 = 馬達加斯加賽車(歐)
++RJJE8P = 叢林之旅 動物救援(美)
++RJJP8P = Jambo!野生動物園探險騎兵(歐)
++RJMERS = 移動世界(美)
++RJMPRS = 移動世界(歐)
++RJNE20 = 建道與賽車(美)
++RJOEXJ = 恐怖體感 咒怨(美)
++RJOJJ9 = 恐怖體感 咒怨(日)
++RJOP99 = 恐怖體感 咒怨(歐)
++RJPJA4 = 實況棒球Wii版(日)
++RJQE5G = 睡衣山姆 別怕黑(美)
++RJQP70 = 睡衣山姆 別怕黑(歐)
++RJREA4 = 勁舞革命 勁爆舞會3[跳舞毯][平衡板](美)
++RJRJA4 = 熱舞革命 Music Fit[平衡板](日)
++RJSENR = 川崎水上摩托(美)
++RJSPNR = 川崎水上摩托(歐)
++RJSPUG = 川崎水上摩托(歐)
++RJSXUG = 川崎水上摩托(X)
++RJTJ01 = 大家的常識力(日)
++RJVEGN = 狂熱醫院 緊急病房(美)
++RJVPGN = 狂熱醫院 緊急病房(歐)
++RJWJEL = 猛犸象與神秘之石(日)
++RJXE5G = 去玩吧伐木工[平衡板](美)
++RJYE5Z = 費茲維澤醫生的動物大拯救[平衡板](美)
++RJZP7U = SNK街機經典Vol1(歐)
++RK2EEB = 超執刀 新血[WiFi](美)
++RK2JEB = 超執刀 新血[WiFi](日)
++RK2P01 = 超執刀 新血[WiFi](歐)
++RK4JAF = 結界師 黑芒樓之影(日)
++RK6E18 = 穿越迷路2[平衡板][WiFi](美)
++RK6J18 = 穿越迷路2[平衡板][WiFi](日)
++RK6P18 = 穿越迷路2[平衡板][WiFi](歐)
++RK7J0A = 黃金之絆(日)
++RK8E54 = 美國職業棒球大聯盟 2K8(美)
++RK9EA4 = 卡拉OK革命[麥克風](美)
++RK9PA4 = 卡拉OK革命[麥克風](歐)
++RKAE6K = 卡拉斯Wii射擊集錦(美)
++RKAJMS = 卡拉斯Wii射擊集錦(日)
++RKAK8M = 卡拉斯Wii射擊集錦(韓)
++RKAP6K = 卡拉斯Wii射擊集錦(歐)
++RKBE41 = 卡波其涂鴉(美)
++RKBP41 = 卡波其涂鴉(歐)
++RKDEEB = 超執刀 再次執刀(美)
++RKDJEB = 超執刀 再次執刀(日)
++RKDJG9 = 超執刀 再次執刀(日)
++RKDP01 = 超執刀 再次執刀(歐)
++RKDPEB = 超執刀 再次執刀(歐)
++RKEENR = 消失的檔案(美)
++RKEPGN = 消失的檔案(歐)
++RKEPNR = 消失的檔案(歐)
++RKFE7U = 格斗之王合輯 大蛇傳說(美)
++RKFEH4 = 格斗之王合輯 大蛇傳說(美)
++RKFP7U = 格斗之王合輯 大蛇傳說(歐)
++RKGEGY = 貝茲娃娃(美)
++RKGPGY = 貝茲娃娃(歐)
++RKHE52 = 功夫熊貓 神龍大俠(美)
++RKHP52 = 功夫熊貓 神龍大俠(歐)
++RKIENR = 國際兒童冰球賽(美)
++RKIPUG = 國際兒童冰球賽(歐)
++RKJJ0Q = 漢字能力檢定協會 250萬人的漢檢(日)
++RKKE6K = 雪女大旋風(美)
++RKLEG9 = 鬼媽媽(美)
++RKLPG9 = 鬼媽媽(歐)
++RKME5D = 真人快打(美)
++RKMP5D = 真人快打(歐)
++RKNJ2N = 漢檢Wii 漢字王決定戰(日)
++RKOJBL = 懶懶熊 一起來悠閑生活[平衡板](日)
++RKPE52 = 功夫熊貓(美)
++RKPJ52 = 功夫熊貓(日)
++RKPK52 = 功夫熊貓(韓)
++RKPP52 = 功夫熊貓(歐)
++RKPY52 = 功夫熊貓(Y)
++RKQENR = 糖果工廠(美)
++RKSENR = 兒童籃球賽(美)
++RKSPUG = 兒童籃球賽(歐)
++RKTENR = 國際兒童足球賽(美)
++RKTXUG = 國際兒童足球賽(X)
++RKVE54 = 大棒球聯盟2(美)
++RKVP54 = 大棒球聯盟2(歐)
++RKWJ18 = 拼圖小狗 每日一問(日)
++RKXE69 = 搖滾樂團(美)
++RKXP69 = 搖滾樂團(歐)
++RKYE20 = 玩具軍人 倒霉戰士(美)
++RKYP20 = 玩具軍人 倒霉戰士(歐)
++RKYP7J = 玩具軍人 倒霉戰士(歐)
++RKZEA4 = 迷失蔚藍Wii(美)
++RKZJA4 = 迷失蔚藍Wii(日)
++RKZPA4 = 迷失蔚藍Wii(歐)
++RL2E78 = 我的馴馬場(美)
++RL2HMR = 我的馴馬場(荷)
++RL2PFR = 我的馴馬場(歐)
++RL3EMJ = 金字塔祖瑪 3(美)
++RL3PMJ = 金字塔祖瑪 3(歐)
++RL4E64 = 樂高印第安納瓊斯2 冒險再續(美)
++RL4P64 = 樂高印第安納瓊斯2 冒險再續(歐)
++RL5E52 = 愛卡莉(美)
++RL5P52 = 愛卡莉(歐)
++RL6E69 = 玩具槍大作戰2 精英(美)
++RL7E69 = 小小寵物店 朋友(美)
++RL7P69 = 小小寵物店 朋友(歐)
++RL8E54 = 實況職業力量棒球2008(美)
++RL9PHZ = 臺球天王(歐)
++RLADMR = 一擲千金(德)
++RLAE20 = 一擲千金(美)
++RLAPMR = 一擲千金(歐)
++RLBEWR = 樂高蝙蝠俠(美)
++RLBPWR = 樂高蝙蝠俠(歐)
++RLCP7J = 愛如鮮花盛開(歐)
++RLDEGY = 龍的傳說(美)
++RLDPFK = 龍的傳說(歐)
++RLEEFS = 大滿貫保齡球2(美)
++RLEPFS = 大滿貫保齡球2(歐)
++RLFE64 = 星球大戰 復制戰紀(美)
++RLFP64 = 星球大戰 復制戰紀(歐)
++RLGE64 = 樂高星球大戰 完整的傳奇(美)
++RLGJ52 = 樂高星球大戰 完整的傳奇(日)
++RLGP64 = 樂高星球大戰 完整的傳奇(歐)
++RLHE52 = 小聯盟世界錦標賽2008(美)
++RLHP52 = 小聯盟世界錦標賽2008(歐)
++RLIE64 = 樂高印第安納瓊斯(美)
++RLIP64 = 樂高印第安納瓊斯(歐)
++RLJEHJ = 線條滑雪2(美)
++RLJPKM = 線條滑雪2(歐)
++RLKEGY = 虛幻勇士 追求無限(美)
++RLKPFK = 虛幻勇士 追求無限(歐)
++RLLP70 = 幸運的路克 獨闖西部(歐)
++RLMJH4 = 合金彈頭精選集(日)
++RLNFMR = 蘭達島生存游戲[平衡板](法)
++RLNHMR = 前進魯賓遜[平衡板](荷)
++RLNIMR = 前進魯賓遜[平衡板](意)
++RLNPMR = 前進魯賓遜[平衡板](歐)
++RLPE69 = 小小寵物店(美)
++RLPP69 = 小小寵物店(歐)
++RLQE52 = 大聯盟運動(美)
++RLQP52 = 大聯盟運動(歐)
++RLRE4F = 古墓麗影 十周年紀念版(美)
++RLRJEL = 古墓麗影 十周年紀念版(日)
++RLRP4F = 古墓麗影 十周年紀念版(歐)
++RLSE8P = 異形特攻隊(美)
++RLSP8P = 異形特攻隊(歐)
++RLTENR = 倫敦出租車 高峰時間(美)
++RLTPNR = 倫敦出租車 高峰時間(歐)
++RLTXUG = 倫敦出租車 高峰時間(X)
++RLUE4Q = 閃電狗(美)
++RLUP4Q = 閃電狗(歐)
++RLUX4Q = 閃電狗(X)
++RLUY4Q = 閃電狗(Y)
++RLVE78 = 降世神通最后的空氣大師(美)
++RLVP78 = 降世神通最后的空氣大師(歐)
++RLWE78 = 料理鼠王(美)
++RLWJ78 = 料理鼠王(日)
++RLWP78 = 料理鼠王(歐)
++RLWW78 = 料理鼠王(W)
++RLWX78 = 料理鼠王(X)
++RLWY78 = 料理鼠王(Y)
++RLWZ78 = 料理鼠王(Z)
++RLXEMJ = 埃及祖瑪 法老王的挑戰(美)
++RLXP36 = 埃及祖瑪 法老王的挑戰(歐)
++RLYEWR = 華納群星總動員 超級兵工廠(美)
++RLYPWR = 華納群星總動員 超級兵工廠(歐)
++RLZE4Z = 企鵝保衛戰(美)
++RLZP4Z = 企鵝保衛戰(歐)
++RM2E69 = 榮譽勛章 英雄2[WiFi](美)
++RM2J13 = 榮譽勛章 英雄2[WiFi](日)
++RM2P69 = 榮譽勛章 英雄2[WiFi](歐)
++RM2U69 = 榮譽勛章 英雄2[WiFi](英)
++RM2X69 = 榮譽勛章 英雄2[WiFi](X)
++RM3A01 = 銀河戰士3 腐蝕(A)
++RM3E01 = 銀河戰士3 腐蝕(美)
++RM3J01 = 銀河戰士3 腐蝕(日)
++RM3P01 = 銀河戰士3 腐蝕(歐)
++RM4E41 = 怪物四驅 世界巡回賽(美)
++RM4J41 = 怪物四驅 世界巡回賽(日)
++RM4P41 = 怪物四驅 世界巡回賽(歐)
++RM5E7D = 木乃伊歸來3 龍帝之墓(美)
++RM5P7D = 木乃伊歸來3 龍帝之墓(歐)
++RM6EEB = 巴洛克(美)
++RM6P99 = 巴洛克(歐)
++RM7E4F = 怪物實驗室[WiFi](美)
++RM7P4F = 怪物實驗室[WiFi](歐)
++RM8E01 = 馬里奧派對8(美)
++RM8J01 = 馬里奧派對8(日)
++RM8K01 = 馬里奧派對8(韓)
++RM8P01 = 馬里奧派對8(歐)
++RM9EGM = 蘑菇人 孢子大戰(美)
++RM9PGM = 蘑菇人 孢子大戰(歐)
++RMAE01 = 用Wii玩馬里奧網球GC(美)
++RMAJ01 = 用Wii玩馬里奧網球GC(日)
++RMAP01 = 用Wii玩馬里奧網球GC(歐)
++RMBE01 = 超級馬里奧棒球場 家庭棒球(美)
++RMBJ01 = 超級馬里奧棒球場 家庭棒球(日)
++RMBP01 = 超級馬里奧棒球場 家庭棒球(歐)
++RMCE01 = 馬里奧賽車[WiFi](美)
++RMCJ01 = 馬里奧賽車[WiFi](日)
++RMCK01 = 馬里奧賽車[WiFi](韓)
++RMCP01 = 馬里奧賽車[WiFi](歐)
++RMDE69 = 美式橄欖球大聯盟07[WiFi](美)
++RMDP69 = 美式橄欖球大聯盟07[WiFi](歐)
++RMEJDA = 大聯盟Wii投擲(日)
++RMFE68 = AMF保齡球 非同尋常(美)
++RMFP68 = AMF保齡球 非同尋常(歐)
++RMGA01 = 超級馬里奧銀河(A)
++RMGE01 = 超級馬里奧銀河(美)
++RMGJ01 = 超級馬里奧銀河(日)
++RMGK01 = 超級馬里奧銀河(韓)
++RMGP01 = 超級馬里奧銀河(歐)
++RMHE08 = 怪物獵人3[WiFi](美)
++RMHJ08 = 怪物獵人3[WiFi](日)
++RMIE20 = 瑪戈的單詞大腦(美)
++RMIP7J = 瑪戈的單詞大腦(歐)
++RMJJC8 = 麻將大會(日)
++RMLEH4 = 合金彈頭精選集(美)
++RMLJH4 = 合金彈頭精選集(日)
++RMLK52 = 合金彈頭精選集(韓)
++RMLP7U = 合金彈頭精選集(歐)
++RMLPH4 = 合金彈頭精選集(歐)
++RMME7U = 水銀融化 革命(美)
++RMMJ7U = 水銀融化 革命(日)
++RMMP7U = 水銀融化 革命(歐)
++RMNDFR = 我的寵物旅店(德)
++RMNHMN = 我的寵物旅店(荷)
++RMNHMR = 我的寵物旅店(荷)
++RMNPFR = 我的寵物旅店(歐)
++RMOE52 = 怪獸大卡車(美)
++RMOP52 = 怪獸大卡車(歐)
++RMPE54 = 職業力量棒球2008(美)
++RMPP54 = 職業力量棒球2008(歐)
++RMQENR = 魔法制造者 末日寶石(美)
++RMQPUG = 魔法制造者 末日寶石(歐)
++RMQXUG = 魔法制造者 末日寶石(X)
++RMRE5Z = 小魔怪魔法馬戲團(美)
++RMRPNK = 小魔怪魔法馬戲團(歐)
++RMRXNK = 小魔怪魔法馬戲團(X)
++RMSE52 = 驚奇漫畫 終極聯盟2[WiFi](美)
++RMSP52 = 驚奇漫畫 終極聯盟2([WiFi]歐)
++RMT101 = 銀河戰士1
++RMT202 = 自制 銀河戰士2(自)
++RMTJ18 = 桃太郎電鐵16北海道大移動[WiFi](日)
++RMUE52 = 漫畫英雄聯盟(美)
++RMUJ2K = 漫畫英雄聯盟(日)
++RMUP52 = 漫畫英雄聯盟(歐)
++RMVE69 = 榮譽勛章 先遣部隊(美)
++RMVP69 = 榮譽勛章 先遣部隊(歐)
++RMVX69 = 榮譽勛章 先遣部隊(X)
++RMWE20 = M&M巧克力卡丁賽車(美)
++RMWP20 = M&M巧克力卡丁賽車(歐)
++RMXE78 = 極限越野 突破[WiFi](美)
++RMXP78 = 極限越野 突破[WiFi](歐)
++RMYE5Z = 超級卡丁車GP(美)
++RMYPUG = 超級卡丁車GP(歐)
++RMYXUG = 超級卡丁車GP(X)
++RMZE5Z = 神話制造者 崔克茜在玩具島(美)
++RMZPUG = 神話制造者 崔克茜在玩具島(歐)
++RN2EAF = Namco博物館重制版(美)
++RN2P70 = Namco博物館重制版(歐)
++RN3E78 = 海綿寶寶 玩具機器人來襲(美)
++RN3J78 = 海綿寶寶 玩具機器人來襲(日)
++RN3P78 = 海綿寶寶 玩具機器人來襲(歐)
++RN3X78 = 海綿寶寶 玩具機器人來襲(X)
++RN4E41 = 創造新世紀(美)
++RN4P41 = 創造新世紀(歐)
++RN5E78 = 赤裸兄弟樂隊(美)
++RN5P78 = 赤裸兄弟樂隊(歐)
++RN6ENR = 北美狩獵盛典(美)
++RN6P7J = 北美狩獵盛典(歐)
++RN7E78 = 鄰居間的游戲(美)
++RN7P78 = 鄰居間的游戲(歐)
++RN8JC8 = 信長的野望·革新 威力加強版(日)
++RN9E4F = 巨蟲魔島(美)
++RN9JEL = 巨蟲魔島(日)
++RN9P4F = 巨蟲魔島(歐)
++RNAE69 = 美國大學橄欖球2009(美)
++RNBE69 = 美國職業籃球2008[WiFi](美)
++RNBP69 = 美國職業籃球2008[WiFi](歐)
++RNBX69 = 美國職業籃球2008[WiFi](X)
++RNCEH4 = SNK街機經典Vol1(美)
++RNCPH4 = SNK街機經典Vol1(歐)
++RNDJAF = 交響情人夢 夢之☆管弦樂(日)
++RNEEDA = 火影忍者疾風傳 激斗忍者大戰 3[WiFi](美)
++RNEJDA = 火影忍者疾風傳 激斗忍者大戰EX3(日)
++RNFE69 = 美式橄欖球大聯盟08[WiFi](美)
++RNFP69 = 美式橄欖球大聯盟08[WiFi](歐)
++RNGJ99 = 魔法老師涅吉!新契約大戰(日)
++RNHE41 = 英雄不再(美)
++RNHJ99 = 英雄不再(日)
++RNHK8M = 英雄不再(韓)
++RNHP41 = 英雄不再(歐)
++RNHP99 = 英雄不再(歐)
++RNIPGT = 休養生息 營養調理[平衡板](歐)
++RNJE4F = 迷你忍者(美)
++RNJP4F = 迷你忍者(歐)
++RNKE69 = 玩具槍大戰(美)
++RNKP69 = 玩具槍大戰(歐)
++RNLE54 = 北美冰球聯盟2009(美)
++RNLP54 = 北美冰球聯盟2009[WiFi](歐)
++RNME5Z = 面包忍者(美)
++RNMPUG = 面包忍者(歐)
++RNMXUG = 面包忍者(X)
++RNNE4Q = 納尼亞傳奇 凱斯賓王子(美)
++RNNJ4Q = 納尼亞傳奇 凱斯賓王子(日)
++RNNP4Q = 納尼亞傳奇 凱斯賓王子(歐)
++RNNX4Q = 納尼亞傳奇 凱斯賓王子(X)
++RNNY4Q = 納尼亞傳奇 凱斯賓王子(Y)
++RNNZ4Q = 納尼亞傳奇 凱斯賓王子(Z)
++RNOJ01 = 異色代碼 R 記憶之門(日)
++RNOP01 = 異色代碼 R 記憶之門(歐)
++RNPE69 = 極品飛車 街頭職業賽(美)
++RNPJ13 = 極品飛車 街頭職業賽(日)
++RNPK69 = 極品飛車 街頭職業賽(韓)
++RNPP69 = 極品飛車 街頭職業賽(歐)
++RNPX69 = 極品飛車 街頭職業賽(X)
++RNPY69 = 極品飛車 街頭職業賽(Y)
++RNRE41 = 火爆機車[WiFi](美)
++RNRJ41 = 火爆機車[WiFi](日)
++RNRP41 = 火爆機車[WiFi](歐)
++RNSD69 = 極品飛車10卡本峽谷(德)
++RNSE69 = 極品飛車10卡本峽谷(美)
++RNSF69 = 極品飛車10卡本峽谷(法)
++RNSJ13 = 極品飛車10卡本峽谷(日)
++RNSP69 = 極品飛車10卡本峽谷(歐)
++RNSX69 = 極品飛車10卡本峽谷(X)
++RNUE8P = 南茜朱兒 冰溪白狼(美)
++RNVE5Z = 阿努比斯2(美)
++RNVP5Z = 阿努比斯2(歐)
++RNVPUG = 阿努比斯2(歐)
++RNVXUG = 阿努比斯2(X)
++RNWJAF = NAMCO嘉年華會(日)
++RNWKAF = Namco博物館重制版(韓)
++RNXEDA = 火影忍者疾風傳 激斗忍者大戰(美)
++RNXJDA = 火影忍者疾風傳 激斗忍者大戰(日)
++RNXPDA = 火影忍者疾風傳 激斗忍者大戰(歐)
++RNYEDA = 火影忍者疾風傳 激斗忍者大戰 2(美)
++RNYJDA = 火影忍者疾風傳 激斗忍者大戰 2(日)
++RNYPDA = 火影忍者疾風傳 激斗忍者大戰 2(歐)
++RNZE69 = 忍者反應[WiFi](美)
++RNZJ13 = 忍者反應(日)
++RNZK69 = 忍者反應(韓)
++RNZP69 = 忍者反應(歐)
++RO2E7N = 福特越野賽車(美)
++RO2P7N = 福特越野賽車(歐)
++RO3EXJ = 小國王物語(美)
++RO3J99 = 小國王物語(日)
++RO3P99 = 小國王物語(歐)
++RO4JDA = 斗真傳(日)
++RO5E52 = 無敵風火輪賽車 第五戰隊(美)
++RO7E7D = 斯派羅傳說 永夜(美)
++RO7P7D = 斯派羅傳說 永夜(歐)
++RO8E7D = 斯派羅傳說 龍之黎明(美)
++RO8P7D = 斯派羅傳說 龍之黎明(歐)
++RO8X7D = 斯派羅傳說 龍之黎明(X)
++RO9PNK = 水底恐慌(歐)
++ROAE36 = 霸王 黑暗傳奇(美)
++ROAP36 = 霸王 黑暗傳奇(歐)
++ROBE7U = 暗夜殺機 結果(美)
++ROBPPL = 暗夜殺機 結果(歐)
++ROCE5Z = 小魔怪卡丁車(美)
++ROCPNK = 小魔怪卡丁車(歐)
++RODE01 = 瓦里奧制造 平滑移動(美)
++RODJ01 = 瓦里奧制造 平滑移動(日)
++RODK01 = 瓦里奧制造 平滑移動(韓)
++RODP01 = 瓦里奧制造 平滑移動(歐)
++ROEEJZ = 流浪狗之家(美)
++ROEPGT = 流浪狗之家(歐)
++ROFE5Z = 極限越野特別版(美)
++ROFPUG = 極限越野特別版(歐)
++ROGE78 = 塔克和惡心的監護人(美)
++ROGP78 = 塔克和惡心的監護人(歐)
++ROHJAF = 快樂組舞(日)
++ROJE52 = 拉帕拉 大眾釣魚(美)
++ROJP52 = 惠寶來 大家來釣魚(歐)
++ROKJ18 = 卡拉OK 歡樂之聲Wii(日)
++ROLE8P = 馬里奧與索尼克在溫哥華冬奧會[WiFi][平衡板](美)
++ROLJ01 = 馬里奧與索尼克在溫哥華冬奧會[WiFi][平衡板](日)
++ROLK01 = 馬里奧與索尼克在溫哥華冬奧會[WiFi][平衡板](韓)
++ROLP8P = 馬里奧與索尼克在溫哥華冬奧會[WiFi][平衡板](歐)
++ROMJ08 = 怪物獵人G[WiFi](日)
++RONEG9 = 御姐玫瑰 革命[WiFi](美)
++RONJG9 = 御姐玫瑰 革命[WiFi](日)
++RONPG9 = 御姐玫瑰 革命[WiFi](歐)
++ROPE41 = 狩獵季節(美)
++ROPP41 = 狩獵季節(歐)
++ROQJEP = 巴洛克(日)
++ROSJ01 = 魔法指揮棒[WiFi](日)
++ROTE20 = 雙重打擊 雷電行動(美)
++ROTP20 = 雙重打擊 雷電行動(歐)
++ROTP7J = 雙重打擊 雷電行動(歐)
++ROUJAF = 海賊王冒險EP1 隨波蕩漾的秘寶(日)
++ROUPAF = 海賊王冒險EP1 隨波蕩漾的秘寶(歐)
++ROVE6U = 巡游馬戲團(美)
++ROWE08 = 大神(美)
++ROWJ08 = 大神(日)
++ROWP08 = 大神(歐)
++ROXE20 = 上菜啦(美)
++ROXP7J = 上菜啦(歐)
++ROXX7J = 上菜啦(X)
++ROYE41 = 美食從天而降(美)
++ROYP41 = 美食從天而降(歐)
++ROYX41 = 美食從天降(X)
++RP2E69 = 冷知識游戲(美)
++RP2P69 = 冷知識游戲(歐)
++RP3JAF = 高爾夫球選手猿(日)
++RP4E69 = 我的模擬聚會[WiFi](美)
++RP4J13 = 我的模擬聚會[WiFi](日)
++RP4P69 = 我的模擬聚會[WiFi](歐)
++RP5JA4 = 實況力量職業棒球15(日)
++RP6E41 = 寵物 瘋狂的猴子(美)
++RP6P41 = 寵物 瘋狂的猴子(歐)
++RP7E52 = 海盜任務 搜尋黑胡子的密寶(美)
++RP7P52 = 海盜任務 搜尋黑胡子的密寶(歐)
++RP9ERS = 太空黑猩猩(美)
++RP9PRS = 太空黑猩猩(歐)
++RP9XRS = 太空黑猩猩(X)
++RPAF70 = 船槳男孩 迷失(法)
++RPBE01 = 口袋妖怪 戰斗革命[WiFi](美)
++RPBJ01 = 口袋妖怪 戰斗革命[WiFi](日)
++RPBP01 = 口袋妖怪 戰斗革命[WiFi](歐)
++RPCE20 = 難題收藏(美)
++RPCP41 = 難題收藏(歐)
++RPCX7J = 難題收藏(X)
++RPDEGN = PDC世界飛鏢錦標賽2008(美)
++RPDPGN = PDC世界飛鏢錦標賽2008(歐)
++RPFE52 = 森林尋寶 大冒險(美)
++RPFP52 = 森林尋寶 大冒險(歐)
++RPFU52 = 森林尋寶 大冒險(英)
++RPGE5D = 怪獸大破壞(美)
++RPGP5D = 怪獸大破壞(歐)
++RPHPPN = 粉紅豬小妹 游戲(歐)
++RPIE52 = MTV 幫你改裝車(美)
++RPIP52 = MTV 幫你改裝車(歐)
++RPJJ99 = 弧光幻想曲(日)
++RPKE52 = 世界撲克冠軍聯賽2007(美)
++RPKP52 = 世界撲克冠軍聯賽2007(歐)
++RPLE52 = 雷培拉釣魚巡回賽(美)
++RPLP52 = 雷培拉釣魚巡回賽(歐)
++RPMJA4 = 實況力量棒球 職業棒球大聯盟2(日)
++RPNE78 = 我的寵物旅館(美)
++RPOEC8 = 歐波娜大冒險(美)
++RPOJC8 = 歐波娜大冒險(日)
++RPOPC8 = 歐波娜大冒險(歐)
++RPPE41 = 波斯王子 宿敵之劍(美)
++RPPP41 = 波斯王子 宿敵之劍(歐)
++RPQES5 = 桌球派對(美)
++RPQPS5 = 桌球派對(歐)
++RPSE4Q = 迪斯尼公主 魔咒下的旅行(美)
++RPSJ4Q = 迪斯尼公主 魔咒下的旅行(日)
++RPSP4Q = 迪斯尼公主 魔咒下的旅行(歐)
++RPTD52 = 愛心寵物狗(德)
++RPTE52 = 愛心寵物狗(美)
++RPTP52 = 愛心寵物狗(歐)
++RPUJ8P = 魔法氣泡15周年紀念版(日)
++RPVE4Z = 貓貓物語(美)
++RPVPKM = 貓貓物語(歐)
++RPXE69 = EA游樂場(美)
++RPXJ13 = EA游樂場(日)
++RPXP69 = EA游樂場(歐)
++RPYE9B = 魔法高爾夫(美)
++RPYJ9B = 魔法高爾夫(日)
++RPYP9B = 魔法高爾夫(歐)
++RPZJA4 = 實況力量職業棒球Wii決定版[WiFi](日)
++RQ2JK6 = 瘋狂攀登者Wii(日)
++RQ3PGN = PDC世界飛鏢錦標賽2009(歐)
++RQ4E78 = 棉球方塊歷險記(美)
++RQ4J78 = 棉球方塊歷險記(日)
++RQ4P78 = 棉球方塊歷險記(歐)
++RQ5E5G = 瘋狗麥基利(美)
++RQ5P5G = 瘋狗麥基利(歐)
++RQ5X5G = 瘋狗麥基利(歐)
++RQ6EJJ = 妖山詛咒(美)
++RQ6PKM = 妖山詛咒(歐)
++RQ6XKM = 妖山詛咒(X)
++RQ8E08 = GP摩托車賽08(美)
++RQ8P08 = GP摩托車賽08(歐)
++RQ9E69 = 美國職業籃球2009[WiFi](美)
++RQ9F69 = 美國職業籃球2009[WiFi](法)
++RQ9P69 = 美國職業籃球2009[WiFi](歐)
++RQ9S69 = 美國職業籃球2009[WiFi](西)
++RQBENR = 川崎4X4沙灘車(美)
++RQBPNR = 川崎4X4沙灘車(歐)
++RQBPUG = 川崎4X4沙灘車(歐)
++RQBXUG = 川崎4X4沙灘車(X)
++RQCEAF = 大胃王(美)
++RQCJAF = 大胃王(日)
++RQEE6U = 阿加莎克里斯蒂 陽光下的罪惡(美)
++RQEP6V = 阿加莎克里斯蒂 陽光下的罪惡(歐)
++RQFE6U = 破箱人 終極難題冒險(美)
++RQFP6V = 破箱人 終極難題冒險(歐)
++RQGE69 = 我的模擬人生 賽車(美)
++RQGJ13 = 我的模擬人生 賽車(日)
++RQGJ69 = 我的模擬人生 賽車(日)
++RQGP69 = 我的模擬人生 賽車(歐)
++RQIJ01 = NHK紅白猜謎合戰(日)
++RQJE7D = 古惑狼之泰坦巨人[WiFi](美)
++RQJP7D = 古惑狼之泰坦巨人(歐)
++RQJX7D = 古惑狼之泰坦巨人[WiFi](X)
++RQKE41 = 馬戲團游戲(美)
++RQKP41 = 聚會游樂園(歐)
++RQLE64 = 星球大戰之克隆戰爭 共和國英雄(美)
++RQLP64 = 星球大戰之克隆戰爭 共和國英雄(歐)
++RQMEVN = 海底指揮官(美)
++RQMPVN = 海底指揮官(歐)
++RQNEWR = 史酷比最初恐懼(美)
++RQNPWR = 史酷比最初恐懼(歐)
++RQOE69 = 孢子英雄(美)
++RQOP69 = 孢子英雄(歐)
++RQPE52 = 卡貝拉的獵鹿(美)
++RQPP52 = 卡貝拉的獵鹿(歐)
++RQQE70 = 后院橄欖球2009(美)
++RQREXJ = 空中殺手 無罪王牌(美)
++RQRJAF = 空中殺手 無罪王牌(日)
++RQRPAF = 空中殺手 無罪王牌(歐)
++RQSE4Z = 彈珠臺名人堂 威廉收藏版(美)
++RQSP6M = 經典彈珠臺(歐)
++RQTE6U = 阿加莎·克里斯蒂 童謠謀殺案(美)
++RQTP6V = 阿加莎·克里斯蒂 童謠謀殺案(歐)
++RQUEFS = 超級小卡車(美)
++RQVE20 = 太平洋解放者(美)
++RQWEG9 = 益智之迷 戰神的挑戰(美)
++RQWPG9 = 益智之迷 戰神的挑戰(歐)
++RQXP70 = 奧運會上的阿斯特里克斯(歐)
++RQYENR = 夢幻水族世界(美)
++RQZE41 = 異形4X4特技賽車(美)
++RQZP41 = 怪獸4X4特級賽車(歐)
++RR2ENR = 裝載卡車競賽2(美)
++RR2PNR = 裝載卡車競賽2(歐)
++RR2PUG = 裝載卡車競賽2(歐)
++RR3EA4 = 終極聚會挑戰[跳舞毯](美)
++RR3JA4 = 全家挑戰(日)
++RR3PA4 = 一起派對(歐)
++RR4EGY = 熊熊工作室(美)
++RR4PFK = 熊熊工作室(歐)
++RR5E70 = 暴力拳擊2 革命(美)
++RR5P70 = 暴力拳擊2 革命(歐)
++RR7PVP = 一球成名 皇家馬德里 游戲版(歐)
++RR8PUJ = 國際田徑大賽(歐)
++RR9E78 = 世界職業摔角2009[WiFi](美)
++RRAE5Z = 貓王的搖滾大冒險(美)
++RRAPUG = 貓王的搖滾大冒險(歐)
++RRAXUG = 貓王的搖滾大冒險(X)
++RRBE41 = 雷曼 瘋狂兔子(美)
++RRBJ41 = 雷曼 瘋狂兔子(日)
++RRBP41 = 雷曼 瘋狂兔子(歐)
++RRCE52 = 芭比小馬冒險 騎術野營(美)
++RRCP52 = 芭比小馬冒險 騎術野營(歐)
++RRDE69 = 搖滾樂團 樂曲擴展包2(美)
++RRDP69 = 搖滾樂團 樂曲擴展包2(歐)
++RREE69 = 搖滾樂團 樂曲擴展包1(美)
++RREP69 = 搖滾樂團 樂曲擴展包1(歐)
++RRFEE9 = 魚之眼Wii(美)
++RRFPE9 = 魚之眼Wii(歐)
++RRGE52 = 馬達加斯加2 逃往非洲(美)
++RRGP52 = 馬達加斯加2 逃往非洲(歐)
++RRHPUJ = 瑪麗·金的騎術學校2(歐)
++RRHXUJ = 馬術騎師(X)
++RRJFMR = 準備穩妥的廚師(法)
++RRJIMR = 準備穩妥的廚師(意)
++RRJPMR = 準備好的可靠的廚師(歐)
++RRKE70 = 鬼屋魔影(美)
++RRKP70 = 鬼屋魔影(歐)
++RRLE78 = 貝茲娃娃 女孩本搖滾(美)
++RRLP78 = 貝茲娃娃 女孩本搖滾(歐)
++RRLX78 = 貝茲娃娃 女孩本搖滾(X)
++RRLY78 = 貝茲娃娃 女孩本搖滾(Y)
++RRLZ78 = 貝茲娃娃 女孩本搖滾(Z)
++RRME69 = 孩之寶 家庭游戲之夜(美)
++RRMP69 = 孩之寶 家庭游戲之夜(歐)
++RRMX69 = 孩之寶 家庭游戲之夜(X)
++RRPE41 = 正確定價(美)
++RRQE52 = 史萊克的瘋狂嘉年華(美)
++RRQP52 = 史萊克的瘋狂嘉年華(歐)
++RRQX52 = 史萊克的瘋狂嘉年華(X)
++RRRE5Z = 火場英雄 消防隊員(美)
++RRRPRM = 火場英雄 消防隊員(歐)
++RRSE4Q = 迪斯尼 拜訪魯濱遜一家(美)
++RRSJ4Q = 迪斯尼 拜訪魯濱遜一家(日)
++RRSP4Q = 迪斯尼 拜訪魯濱遜一家(歐)
++RRSX4Q = 迪斯尼 拜訪魯濱遜一家(X)
++RRTE52 = 打擊聚會(美)
++RRTP52 = 打擊聚會(歐)
++RRUEJF = 冬季運動會2 下一個挑戰[平衡板](美)
++RRUFRT = 冬季運動會2009 下一個挑戰[平衡板](法)
++RRUJJF = 冬季運動會2009[平衡板](日)
++RRUPRT = 冬季運動會2009[平衡板](歐)
++RRVENR = 戰斗憤怒 機器人戰爭(美)
++RRVPNR = 戰斗憤怒 機器人戰爭(歐)
++RRWJAF = 超級機器人大戰NEO(日)
++RRXE5Z = 怪物卡車競技場(美)
++RRXPUG = 怪物卡車競技場(歐)
++RRXXUG = 怪物卡車競技場(X)
++RRYEHG = 俠盜騎兵 石英地帶大屠殺(美)
++RRYPHY = 俠盜中隊(歐)
++RRZEGY = 魔方世界(美)
++RRZPGY = 魔方世界(歐)
++RS2EGJ = 終極獵鴨(美)
++RS2PGJ = 終極獵鴨(歐)
++RS3E52 = 蜘蛛俠3(美)
++RS3J52 = 蜘蛛俠3(日)
++RS3P52 = 蜘蛛俠3(歐)
++RS3X52 = 蜘蛛俠3(X)
++RS4EXS = 式神之城3(美)
++RS4JJF = 式神之城3(日)
++RS4PXS = 式神之城3(歐)
++RS5EC8 = 戰國無雙KATANA(美)
++RS5JC8 = 戰國無雙KATANA(日)
++RS5PC8 = 戰國無雙KATANA(歐)
++RS7J01 = 光速蒙面俠21 賽場上的最強戰士(日)
++RS8J8N = 上海(日)
++RS9E8P = 索尼克滑板 失重[WiFi](美)
++RS9J8P = 索尼克滑板 失重[WiFi](日)
++RS9P8P = 索尼克滑板 失重[WiFi](歐)
++RSAE78 = 海綿寶寶 亞特蘭蒂斯(美)
++RSAP78 = 海綿寶寶 亞特蘭蒂斯(歐)
++RSBA01 = 任天堂明星大亂斗X[WiFi](A)
++RSBE01 = 任天堂明星大亂斗X[WiFi](美)
++RSBJ01 = 任天堂明星大亂斗X[WiFi](日)
++RSBP01 = 任天堂明星大亂斗X[WiFi](歐)
++RSCD7D = 疤面煞星 掌握世界(德)
++RSCE7D = 疤面煞星 掌握世界(美)
++RSCP7D = 疤面煞星 掌握世界(歐)
++RSCU7D = 疤面煞星 掌握世界(英)
++RSDJAF = SD高達之革命(日)
++RSEJGD = 噬魂者 單調公主(日)
++RSFE7U = 朧村正 妖刀傳(美)
++RSFJ99 = 朧村正 妖刀傳(日)
++RSFP99 = 朧村正 妖刀傳(歐)
++RSHE69 = 我的模擬王國(美)
++RSHJ13 = 我的模擬王國(日)
++RSHK69 = 我的模擬王國(韓)
++RSHP69 = 我的模擬王國(歐)
++RSIE69 = 我的模擬人生(美)
++RSIJ13 = 我的模擬人生(日)
++RSIP69 = 我的模擬人生(歐)
++RSJE41 = 斷劍 圣堂武士之謎(美)
++RSJP41 = 斷劍 圣堂武士之謎(歐)
++RSKE52 = 怪物史萊克3(美)
++RSKP52 = 怪物史萊克3(歐)
++RSKX52 = 怪物史萊克3(X)
++RSLEAF = 劍魂傳說(美)
++RSLJAF = 劍魂傳說(日)
++RSLKAF = 劍魂傳說(韓)
++RSLPAF = 劍魂傳說(歐)
++RSME8P = 超級猴子球 香蕉閃電戰(美)
++RSMJ8P = 超級猴子球 香蕉閃電戰(日)
++RSMP8P = 超級猴子球 香蕉閃電戰(歐)
++RSND69 = 辛普森一家(德)
++RSNE69 = 辛普森一家(美)
++RSNF69 = 辛普森一家(法)
++RSNP69 = 辛普森一家(歐)
++RSNX69 = 辛普森一家(X)
++RSOE4Z = 紙牌麻將游戲專輯(美)
++RSOP4Z = 紙牌麻將游戲專輯(歐)
++RSPE01 = Wii運動(美)
++RSPJ01 = Wii運動(日)
++RSPK01 = Wii運動(韓)
++RSPP01 = Wii運動(歐)
++RSPW01 = Wii運動(中)
++RSQEAF = 家庭滑雪[平衡板](美)
++RSQJAF = 家庭滑雪[平衡板](日)
++RSQPAF = 家庭滑雪[平衡板](歐)
++RSRE8P = 索尼克與神秘指環(美)
++RSRJ8P = 索尼克與神秘指環(日)
++RSRP8P = 索尼克與神秘指環(歐)
++RSSEH4 = 侍魂 六番勝負(美)
++RSSJH4 = 侍魂 六番勝負(日)
++RSSK52 = 侍魂 六番勝負(韓)
++RSSP7U = 侍魂 六番勝負(歐)
++RSTE64 = 星球大戰 原力釋放(美)
++RSTJ52 = 星球大戰 原力釋放(日)
++RSTP64 = 星球大戰 原力釋放(歐)
++RSUENR = 夏季運動會 天堂島(美)
++RSUP41 = 夏季運動會 天堂島(歐)
++RSVE8P = 索尼克 釋放(美)
++RSVJ8P = 索尼克 釋放(日)
++RSVP8P = 索尼克 釋放(歐)
++RSWE08 = 生化間諜(美)
++RSWP08 = 生化間諜(歐)
++RSXE69 = 極限滑雪(美)
++RSXJ13 = 極限滑雪(日)
++RSXK69 = 極限滑雪(韓)
++RSXP69 = 極限滑雪(歐)
++RSYE20 = 冠軍拳擊賽(美)
++RSYP7J = 冠軍拳擊賽(歐)
++RSZJES = 雪女大旋風紗雪小雪的驚奇大騷動(日)
++RSZPGT = 雪女大旋風紗雪小雪的驚奇大騷動(歐)
++RT2E20 = 極地熊寶貝(美)
++RT2P20 = 極地熊寶貝(歐)
++RT2P7J = 極地熊寶貝(歐)
++RT3E54 = Rockstar乒乓球(美)
++RT3JEL = Rockstar乒乓球(日)
++RT3P54 = Rockstar乒乓球(歐)
++RT4EAF = 仙樂傳說 拉塔托斯克的騎士(美)
++RT4JAF = 仙樂傳說 拉塔托斯克的騎士(日)
++RT4PAF = 仙樂傳說 拉塔托斯克的騎士(歐)
++RT5E8P = 世嘉超級明星網球(美)
++RT5P8P = 世嘉超級明星網球(歐)
++RT6FKM = 神奇的旋轉木馬(法)
++RT6PKM = 神奇的旋轉木馬(歐)
++RT7E69 = 泰格伍茲高爾夫巡回07(美)
++RT7F69 = 泰格伍茲高爾夫巡回07(法)
++RT7P69 = 泰格伍茲高爾夫巡回07(歐)
++RT8E69 = 泰格伍茲高爾夫巡回08(美)
++RT8J13 = 泰格伍茲高爾夫巡回08(日)
++RT8K69 = 泰格伍茲高爾夫巡回08(韓)
++RT8P69 = 泰格伍茲高爾夫巡回08(歐)
++RT9E52 = 托尼霍克滑板 練習場[WiFi](美)
++RT9P52 = 托尼霍克滑板 練習場[WiFi](歐)
++RTBE52 = 職業釣魚(美)
++RTBP52 = 職業釣魚(歐)
++RTCE41 = 分裂細胞 雙重間諜(美)
++RTCP41 = 分裂細胞 雙重間諜(歐)
++RTDE6K = 新.中華大仙 米迦勒與美美的冒險(美)
++RTDJES = 新.中華大仙 米迦勒與美美的冒險(日)
++RTDK8M = 新.中華大仙 米迦勒與美美的冒險(韓)
++RTEE78 = 我的寵物醫院(美)
++RTEHMR = 我的寵物醫院(荷)
++RTEPFR = 我的寵物醫院(歐)
++RTFE52 = 變形金剛 游戲(美)
++RTFJ52 = 變形金剛 游戲(日)
++RTFK52 = 變形金剛 游戲(韓)
++RTFP52 = 變形金剛 游戲(歐)
++RTFX52 = 變形金剛 游戲(X)
++RTFY52 = 變形金剛 游戲(Y)
++RTGJ18 = Wi-Fi對應 嚴選桌面游戲[WiFi](日)
++RTHE52 = 托尼霍克滑板(美)
++RTHP52 = 托尼霍克滑板(歐)
++RTIE8P = 古怪運動世界(美)
++RTIJ8P = 瘋狂世界大運動(日)
++RTIP8P = 古怪運動世界(歐)
++RTJE68 = 星艦迷航記 征服(美)
++RTJP68 = 星艦迷航記 征服(歐)
++RTKE5Z = 章魚大作戰[WiFi](美)
++RTKJDQ = 章魚大作戰[WiFi](日)
++RTKK8M = 章魚大作戰[WiFi](韓)
++RTLE18 = 目標！釣魚大師 世界版(美)
++RTLJ18 = 目標！釣魚大師 世界版(日)
++RTLP18 = 目標！釣魚大師 世界版(歐)
++RTME41 = 忍者神龜2007旋風再起(美)
++RTMP41 = 忍者神龜2007旋風再起(歐)
++RTNE41 = 天誅4(美)
++RTNJCQ = 天誅4(日)
++RTNP41 = 天誅4(歐)
++RTOJ8P = 428 被封鎖的涉谷(日)
++RTQENR = 怪物卡車 越野賽(美)
++RTQPUG = 怪物卡車 越野賽(歐)
++RTQXUG = 怪物卡車 越野賽(X)
++RTRE18 = 垂釣大師(美)
++RTRJ18 = 垂釣大師(日)
++RTRP18 = 垂釣大師(歐)
++RTSEVN = 特工少女組 狂歡派對(美)
++RTSP41 = 特工少女組 狂歡派對(歐)
++RTTJAF = 電子雞寵物店(日)
++RTUEKM = 秘密檔案 通古斯(美)
++RTUFKM = 秘密檔案 通古斯(法)
++RTUPKM = 秘密檔案 通古斯(歐)
++RTVE64 = 主題公園 驚奇世界(美)
++RTVP64 = 主題公園 驚奇世界(歐)
++RTWE5D = 摔角聯盟(美)
++RTWP5D = 摔角聯盟(歐)
++RTYP01 = Wii國際象棋[WiFi](歐)
++RTZE08 = 寶島Z 巴爾巴羅斯的秘寶(美)
++RTZJ08 = 寶島Z 巴爾巴羅斯的秘寶(日)
++RTZK08 = 寶島Z 巴爾巴羅斯的秘寶(韓)
++RTZP08 = 寶島Z 巴爾巴羅斯的秘寶(歐)
++RU1P4Q = 自制 迪斯尼想唱就唱 下載版(歐)
++RU2E5Z = 冬季運動會2 下一個挑戰[平衡板](美)
++RU2P4Q = 自制 迪斯尼想唱就唱 下載版(歐)
++RU2P5Z = 冬季運動會2 下一個挑戰[平衡板](歐)
++RU3E5Z = 夏季田徑運動會(美)
++RU4E41 = 我的健身教練2 運動與營養[平衡板](美)
++RU4PLG = 新個人健身教練[平衡板](歐)
++RU4X41 = 新健身首選私人教練[平衡板](X)
++RU5E4Q = 迪士尼公主和青蛙(美)
++RU5P4Q = 公主與青蛙(歐)
++RU5X4Q = 公主與青蛙(X)
++RU5Y4Q = 公主與青蛙(Y)
++RU6PHY = 自由奔跑(歐)
++RU7E5G = 博物館奇妙夜2 決戰史密森尼(美)
++RU7X5G = 博物館奇妙夜2 決戰史密森尼(X)
++RU9EGT = 我的芭蕾舞工作室(美)
++RU9PGT = 天后女孩 芭蕾天后(歐)
++RUAE52 = 怪物卡車 襲擊市區(美)
++RUAP52 = 怪物卡車 襲擊市區(歐)
++RUBEVN = 極致桌上游戲合輯(美)
++RUBP7N = 極致桌上游戲合輯(歐)
++RUCE5Z = 冬季運動會 終極挑戰 2008(美)
++RUCPRT = 冬季運動會 終極挑戰 2008(歐)
++RUCXRT = 冬季運動會 終極挑戰 2008(X)
++RUEE4Q = 豚鼠特工隊(美)
++RUEP4Q = 豚鼠特工隊(歐)
++RUEX4Q = 豚鼠特工隊(X)
++RUEY4Q = 豚鼠特攻隊(歐)
++RUFEMV = 牧場物語 符文工場 邊境(美)
++RUFJ99 = 牧場物語 符文工場 邊境(日)
++RUFP99 = 牧場物語 符文工場 邊境(歐)
++RUGE7T = 雞皮疙瘩恐怖樂園(美)
++RUGP5G = 雞皮疙瘩恐怖樂園(歐)
++RUHE52 = 爆丸 戰斗對決(美)
++RUHP52 = 爆丸 戰斗對決(歐)
++RUHX52 = 爆丸戰士(X)
++RUIE4Q = 迪斯尼 想唱就唱(美)
++RUIP4Q = 迪斯尼 想唱就唱(歐)
++RUIX4Q = 迪斯尼 想唱就唱(X)
++RUKEGT = 我們來搖滾吧 鼓王(美)
++RUKPGT = 我們來搖滾吧 鼓王(歐)
++RULE4Q = 終極樂隊[WiFi](美)
++RULP4Q = 終極樂隊[WiFi](歐)
++RUME5Z = 滑雪射擊[平衡板](美)
++RUMPFR = 夏季田徑運動會(歐)
++RUNJ0Q = 新 右腦達人Wii(日)
++RUOEPL = 閣樓里的外星人(美)
++RUOPPL = 閣樓里的外星人(歐)
++RUPJC8 = 賽馬大亨7 Maximum 2008(日)
++RUQD78 = 飛屋環游記(德)
++RUQE78 = 飛屋環游記(美)
++RUQI78 = 飛屋環游記(歐)
++RUQJJE = 飛屋環游記(日)
++RUQP78 = 飛屋環游記(歐)
++RUQS78 = 飛屋環游記(西)
++RUREPL = 職業撞球名人堂(美)
++RURPPL = 職業撞球名人堂(歐)
++RUSE78 = 海綿寶寶歷險記 致命水珠(美)
++RUSK78 = 海綿寶寶歷險記 致命水珠(韓)
++RUSX78 = 海綿寶寶歷險記 致命水珠(X)
++RUSY78 = 海綿寶寶歷險記 致命水珠(Y)
++RUUE01 = 動物之森 城市大家庭[WiFi](美)
++RUUJ01 = 動物之森 城市大家庭[WiFi](日)
++RUUK01 = 動物之森 城市大家庭[WiFi](韓)
++RUUP01 = 動物之森 城市大家庭[WiFi](歐)
++RUWJC8 = 勝利賽馬世界(日)
++RUXXUG = 都市極限飚車 街道之怒(X)
++RUYE41 = 英雄不再2 負隅頑抗(美)
++RUZE7T = 終極挑戰者(美)
++RUZP5G = 終極間諜(歐)
++RV2E5D = 游戲聚會2(美)
++RV2P5D = 游戲聚會2(歐)
++RV3P6N = 聰明的孩子 嚇人的爬行動物(歐)
++RV7SMR = 幸存者(歐)
++RV8PRT = 海灘暑假快樂挑戰(歐)
++RV9E78 = 降世神通 最后的氣宗 前往地獄(美)
++RV9P78 = 降世神通 最后的氣宗 前往地獄(歐)
++RVAE78 = 降世神通 燃燒的大地(美)
++RVAP78 = 降世神通 燃燒的大地(歐)
++RVBERS = 艾爾文與花栗鼠(美)
++RVBPRS = 艾爾文與花栗鼠(歐)
++RVDPLG = 德伯力克 原罪(歐)
++RVEFMR = 歡迎來到北方(法)
++RVFE20 = 大腳車 碰撞航向(美)
++RVFP7J = 大腳車 碰撞航向(歐)
++RVGE78 = 默夫格里芬縱橫字迷(美)
++RVGP78 = 默夫格里芬縱橫字迷(歐)
++RVHP41 = 拼字游戲互動2009[WiFi][平衡板](歐)
++RVIE4F = 樂高生化戰士(美)
++RVIP4F = 樂高生化戰士(歐)
++RVKEXJ = 瓦爾哈拉騎士 艾德爾傳奇[WiFi](美)
++RVKJ99 = 瓦爾哈拉騎士 艾德爾傳奇[WiFi](日)
++RVLPA4 = 搖滾革命(歐)
++RVNE20 = 凱文塔克的鄉巴佬露營會(美)
++RVNP20 = 凱文塔克的鄉巴佬露營會(歐)
++RVNP7J = 凱文塔克的鄉巴佬露營會(歐)
++RVOEPL = 眩暈滾球[平衡板](美)
++RVOPPL = 眩暈滾球[平衡板](歐)
++RVPEFS = 明星吉他(美)
++RVPPFS = 明星吉他(歐)
++RVQE41 = 電影游戲(美)
++RVQP41 = 電影游戲(歐)
++RVREFS = 叛亂襲擊者 夜鷹行動(美)
++RVRPFS = 叛亂襲擊者 夜鷹行動(歐)
++RVRPKG = 叛亂襲擊者 夜鷹行動(歐)
++RVSE69 = 極限滑板[平衡板](美)
++RVSJ13 = 極限滑板[平衡板](日)
++RVSP69 = 極限滑板[平衡板](歐)
++RVTFMR = 真實故事 獸醫(法)
++RVTPMR = 我的寵物俱樂部(歐)
++RVTXMR = 真實故事 獸醫(X)
++RVUE8P = VR網球2009[MP][WiFi](美)
++RVUP8P = VR網球2009[MP][WiFi](歐)
++RVVE78 = 大沙灘運動(美)
++RVVP78 = 大沙灘運動(歐)
++RVXFRT = 現代冬季兩項2009[平衡板](法)
++RVXPRT = 現代冬季兩項2009[平衡板](歐)
++RVYD52 = 使命召喚 世界大戰[WiFi](德)
++RVYE52 = 使命召喚 世界大戰[WiFi](美)
++RVYK52 = 使命召喚 世界大戰[WiFi](韓)
++RVYP52 = 使命召喚 世界大戰[WiFi](歐)
++RVYX52 = 使命召喚 世界大戰[WiFi](X)
++RVYY52 = 使命召喚 世界大戰[WiFi](Y)
++RVZE52 = 怪獸大戰外星人(美)
++RVZP52 = 怪獸大戰外星人(歐)
++RW3E4Q = 加勒比海盜 世界的盡頭(美)
++RW3J4Q = 加勒比海盜 世界的盡頭(日)
++RW3P4Q = 加勒比海盜 世界的盡頭(歐)
++RW4D41 = 我的詞匯教練(德)
++RW5F41 = 誰想成為百萬富翁？第二集(法)
++RW5P41 = 誰想成為百萬富翁？第二集(歐)
++RW6PA4 = 勁舞革命 美少女俱樂部[跳舞毯](歐)
++RW7E41 = 肖恩懷特滑雪[平衡板](美)
++RW8P41 = 想象 冠軍騎士(歐)
++RW9P78 = 世界職業摔角聯盟2009[WiFi](歐)
++RW9X78 = 世界職業摔角聯盟2009[WiFi](X)
++RWAD78 = 機器人瓦伊(德)
++RWAE78 = 機器人瓦伊(美)
++RWAJ78 = 機器人瓦伊(日)
++RWAK78 = 機器人瓦伊(韓)
++RWAP78 = 機器人瓦伊(歐)
++RWAR78 = 機器人瓦伊(俄)
++RWAU78 = 機器人瓦伊(英)
++RWAX78 = 機器人瓦伊(X)
++RWAY78 = 機器人瓦伊(Y)
++RWAZ78 = 機器人瓦伊(Z)
++RWBENR = 川崎雪橇(美)
++RWBXUG = 川崎雪橇(X)
++RWCE4Z = 榮譽彈珠臺 威廉姆斯家族珍藏(美)
++RWCP4Z = 榮譽彈珠臺 威廉姆斯家族珍藏(歐)
++RWDC52 = 自制 吉他英雄 下載版(歐)
++RWDE5G = 野生大地 非洲之旅(美)
++RWDP5G = 野生大地 非洲之旅(歐)
++RWEEA4 = 實況足球2008[WiFi](美)
++RWEJA4 = 實況足球2008[WiFi](日)
++RWEPA4 = 實況足球2008[WiFi](歐)
++RWFH41 = 我的單詞教練(荷)
++RWGE08 = 全民高爾夫[WiFi](美)
++RWGJ08 = 全民高爾夫[WiFi](日)
++RWGP08 = 全民高爾夫[WiFi](歐)
++RWHP4F = 頂級王牌 神秘博士(歐)
++RWHPWK = 頂級王牌 神秘博士(歐)
++RWIE18 = 翼神之島(美)
++RWIJ18 = 翼神之島(日)
++RWIP18 = 翼神之島(歐)
++RWJENR = 單詞瓊聚會(美)
++RWJPNR = 單詞瓊聚會(歐)
++RWKE5G = 料理媽媽 世界廚房(美)
++RWKPGT = 料理媽媽 世界廚房(歐)
++RWLE01 = 瓦里奧大陸 搖動(美)
++RWLJ01 = 瓦里奧大陸 搖動(日)
++RWLP01 = 瓦里奧大陸 搖動(歐)
++RWME78 = 百戰天蟲 怪異空間(美)
++RWMP78 = 百戰天蟲 怪異空間(歐)
++RWNF70 = 警告 公路規則(法)
++RWOE69 = 壟斷(美)
++RWOJ13 = 壟斷(日)
++RWOP69 = 壟斷(歐)
++RWQPSP = 真實世界斯諾克冠軍賽2008(歐)
++RWRE4F = 古怪賽車 沖撞(美)
++RWRP4F = 古怪賽車 沖撞(歐)
++RWSE8P = 馬里奧與索尼克在奧運會[WiFi](美)
++RWSJ01 = 馬里奧與索尼克在奧運會[WiFi](日)
++RWSK01 = 馬里奧與索尼克在奧運會[WiFi](韓)
++RWSP8P = 馬里奧與索尼克在奧運會[WiFi](歐)
++RWTEG9 = BEN 10 外星神力(美)
++RWTPG9 = BEN 10 外星神力(歐)
++RWUE52 = X戰警 金鋼狼(美)
++RWUP52 = X戰警 金鋼狼(歐)
++RWUX52 = X戰警 金鋼狼(X)
++RWWE78 = 世界職業摔角2008[WiFi](美)
++RWWJ78 = 世界職業摔角2008[WiFi](日)
++RWWP78 = 世界職業摔角2008[WiFi](歐)
++RWXES5 = 印第安武士 一個勇士的傳說(美)
++RWXPS5 = 印第安武士 一個勇士的傳說(歐)
++RWYPHH = 逃亡2 海龜之夢(歐)
++RWZE5G = 奇跡世界游樂園(美)
++RWZP5G = 奇跡世界游樂園(歐)
++RWZX5G = 奇跡世界游樂園(X)
++RX2E70 = 我和我的小馬2(美)
++RX2P70 = 我和我的小馬2(歐)
++RX3E01 = 激情漫游 特技競速[WiFi](美)
++RX4PMT = 鬼馬小靈精恐怖學校鬼怪的運動日(歐)
++RX5E52 = 托尼霍克 直立滑行(美)
++RX5P52 = 托尼霍克：直立滑行(歐)
++RX6E78 = 減肥達人[平衡板](美)
++RX6P78 = 減肥達人[平衡板](歐)
++RX7JGD = 梅吉瑪吉演奏比賽(日)
++RX8JA4 = 實況力量棒球NEXT(日)
++RX9E69 = 極品飛車 臥底(美)
++RX9J13 = 極品飛車 臥底(日)
++RX9K69 = 極品飛車 臥底(韓)
++RX9P69 = 極品飛車 臥底(歐)
++RX9X69 = 極品飛車 臥底(X)
++RX9Y69 = 極品飛車 臥底(Y)
++RXAE78 = 美國職業摔角聯盟2010[WiFi](美)
++RXAP78 = 美國職業摔角聯盟2010[WiFi](歐)
++RXBE70 = 后院棒球10(美)
++RXBP70 = 后院棒球10(歐)
++RXCE4Z = 戴夫·米拉自行車越野挑戰賽(美)
++RXCP4Z = 戴夫·米拉自行車越野挑戰賽(歐)
++RXCPGT = 戴夫·米拉自行車越野挑戰賽(歐)
++RXDD4Q = 靈機一動(德)
++RXDE4Q = 靈機一動(美)
++RXDJ4Q = 靈機一動(日)
++RXDP4Q = 靈機一動(歐)
++RXDR4Q = 靈機一動(俄)
++RXDX4Q = 靈機一動(X)
++RXDY4Q = 靈機一動(Y)
++RXEJDA = 棒球大聯盟Wii(日)
++RXFEVN = 海洋大亨(美)
++RXGE6K = 吉綸立方(美)
++RXHF5D = 混沌之家(法)
++RXIE52 = 變形金剛2 卷土重來[WiFi](美)
++RXIP52 = 變形金剛2 卷土重來[WiFi](歐)
++RXJJDA = 人生游戲Wii EX(日)
++RXKEGL = 電視秀之王聚會(美)
++RXKFGL = 電視秀之王聚會(法)
++RXKPGL = 電視秀之王聚會(歐)
++RXLE41 = 實習醫生格蕾(美)
++RXLP41 = 實習醫生格蕾(歐)
++RXMJ8P = 米布里和特布里(日)
++RXNEXS = 再次體感釣魚(美)
++RXPEXS = 實感釣魚[WiFi](美)
++RXPJJF = 實感釣魚[WiFi](日)
++RXPPGT = 實感釣魚[WiFi](歐)
++RXQEWR = 野獸家園(美)
++RXQPWR = 野獸家園(歐)
++RXRERS = 浪漫鼠德佩羅(美)
++RXRPRS = 浪漫鼠德佩羅(歐)
++RXRXRS = 浪漫的老鼠(歐)
++RXSEA4 = 熱舞生涯 勁爆舞會[跳舞毯](美)
++RXSPA4 = 熱舞生涯 勁爆舞會[跳舞毯](歐)
++RXUE41 = 沖浪企鵝(美)
++RXUP41 = 沖浪企鵝(歐)
++RXUX41 = 沖浪企鵝(X)
++RXVXWP = 填字游戲(X)
++RXWE20 = 巧克力豆海灘聚會(美)
++RXXE4Q = 化石超進化 起源(美)
++RXXP4Q = 化石超進化 起源(歐)
++RXYE4Z = 更多的難題挑戰(美)
++RXYP4Z = 更多的難題挑戰(歐)
++RXZE52 = 卡貝拉危險狩獵2009(美)
++RXZP52 = 卡貝拉危險狩獵2009(歐)
++RY2E41 = 雷曼 瘋狂兔子2[WiFi](美)
++RY2J41 = 雷曼 瘋狂兔子2[WiFi](日)
++RY2K41 = 雷曼 瘋狂兔子2[WiFi](韓)
++RY2P41 = 雷曼 瘋狂兔子2[WiFi](歐)
++RY2R41 = 雷曼 瘋狂兔子2[WiFi](俄)
++RY3E41 = 雷曼 瘋狂兔子 電視聚會[平衡板](美)
++RY3J41 = 雷曼 瘋狂兔子 電視聚會[平衡板](日)
++RY3K41 = 雷曼 瘋狂兔子 電視聚會[WiFi][平衡板](韓)
++RY3P41 = 雷曼 瘋狂兔子 電視聚會[WiFi][平衡板](歐)
++RY4J8P = 噗喲噗喲7(日)
++RY5E52 = 夏日運動大聯盟(美)
++RY5P52 = 夏日運動大聯盟(歐)
++RY6EA4 = 去戶外吧[平衡板](美)
++RY7PHZ = 忍者首領(歐)
++RY8EFS = 巴斯專業店 魚餌(美)
++RYAJDA = 小雙俠Wii 噗通噗通大賽車(日)
++RYBE69 = 轟炸方塊 猛擊聚會[WiFi](美)
++RYBP69 = 轟炸方塊 猛擊聚會[WiFi](歐)
++RYDELT = 寵物伴侶 動物醫生(美)
++RYDP6V = 寵物伴侶 動物醫生(歐)
++RYEEEB = 101合1 聚會游戲大合集(美)
++RYEPHZ = 101合1 聚會游戲大合集(歐)
++RYGE9B = 阿爾戈斯戰士 筋肉沖擊(美)
++RYGJ9B = 阿爾戈斯戰士 筋肉沖擊(日)
++RYGP99 = 阿爾戈斯戰士 筋肉沖擊(歐)
++RYHES5 = 虛擬宇宙 扭曲之塔(美)
++RYHPS5 = 虛擬宇宙 扭曲之塔(歐)
++RYIE98 = 涂鴉王子(美)
++RYIE9B = 涂鴉王子(美)
++RYIP9B = 涂鴉王子(歐)
++RYKEAF = 世界滑雪&滑雪板[平衡板](美)
++RYKJAF = 世界滑雪&滑雪板[平衡板](日)
++RYKPAF = 世界滑雪&滑雪板[平衡板](歐)
++RYLDSV = 德國頂級模特(德)
++RYNE6U = 哈迪男孩 隱藏的盜竊(美)
++RYNP6V = 哈迪男孩 隱藏的盜竊(歐)
++RYOEA4 = 游戲王5DS 破碎轉輪(美)
++RYOJA4 = 游戲王5DS 破碎轉輪(日)
++RYOPA4 = 游戲王5DS 破碎轉輪(歐)
++RYQE69 = 打破砂鍋問到底(美)
++RYQP69 = 打破砂鍋問到底(歐)
++RYQX69 = 打破砂鍋問到底(X)
++RYRE41 = 你的塑身(美)
++RYRP41 = 你的塑身(歐)
++RYTE4Z = 職業牛仔騎士公司 斜道之外(美)
++RYVEMS = 街機射擊 愛貝羅(美)
++RYVJMS = 伊魯貝羅Wii(日)
++RYWE01 = 輕松頭腦教室(美)
++RYWJ01 = 輕松頭腦教室(日)
++RYWK01 = 輕松頭腦教室(韓)
++RYWP01 = 輕松頭腦教室(歐)
++RYXE20 = 雅馬哈超級摩托(美)
++RYXP20 = 雅馬哈超級摩托(歐)
++RYXP7J = 雅馬哈超級摩托(歐)
++RYZE6U = 世界派對游戲(美)
++RYZPTV = 游玩天下[平衡板](歐)
++RZ2JG9 = 簡單Wii系列1大家一起賽車[WiFi](日)
++RZ3JG9 = 簡單Wii系列2大家一起釣魚[WiFi](日)
++RZ4JG9 = 簡單Wii系列3 賭場聚會[WiFi](日)
++RZ5JG9 = 簡單Wii系列4戰斗射擊[WiFi](日)
++RZ6JG9 = 簡單Wii系列5打磚塊[WiFi](日)
++RZ7JG9 = 簡單Wii系列6喧嘩槍戰[WiFi](日)
++RZ8JG9 = 簡單2000系列1 桌面游戲(日)
++RZ9EG9 = 簡單2000系列2 家庭聚會(美)
++RZ9JG9 = 簡單2000系列2 家庭聚會(日)
++RZ9PG9 = 簡單2000系列2 家庭聚會(歐)
++RZCE6K = 大圣王(美)
++RZDA01 = 塞爾達傳說 黎明公主(A)
++RZDE01 = 塞爾達傳說 黎明公主(美)
++RZDJ01 = 塞爾達傳說 黎明公主(日)
++RZDK01 = 塞爾達傳說 黎明公主(韓)
++RZDP01 = 塞爾達傳說 黎明公主(歐)
++RZEE52 = 科學爸爸(美)
++RZEP52 = 科學爸爸(歐)
++RZFPKM = 秘密檔案2 清心(歐)
++RZHE5G = 動物醫院[WiFi](美)
++RZHP5G = 動物醫院[WiFi](歐)
++RZHX5G = 動物醫院[WiFi](X)
++RZIPRT = RTL冬季運動會2010(歐)
++RZJD69 = 死亡空間 撤離(德)
++RZJE69 = 死亡太空 撤離(美)
++RZJJ13 = 死亡太空 撤離(日)
++RZJP69 = 死亡太空 撤離(歐)
++RZKE20 = 謎題王國(美)
++RZKP7J = 謎題王國(歐)
++RZLE41 = 烹飪戰爭(美)
++RZLP41 = 烹飪聚會(歐)
++RZNJ01 = 斬擊的女武神(日)
++RZOE78 = 動物園世界(美)
++RZOP78 = 動物園世界(歐)
++RZPE01 = 林克的弓箭訓練(美)
++RZPJ01 = 林克的弓箭訓練(日)
++RZPP01 = 林克的弓箭訓練(歐)
++RZREGT = 佐羅的宿命(美)
++RZRPGT = 佐羅的宿命(歐)
++RZSEGJ = 極速地帶(美)
++RZSP68 = 飛速賽車(歐)
++RZTE01 = Wii運動 度假勝地[MP](美)
++RZTJ01 = Wii運動 度假勝地[MP](日)
++RZTP01 = Wii運動 度假勝地[MP](歐)
++RZTW01 = Wii運動 度假勝地[MP](中)
++RZUE4Z = 彩色之旅(美)
++RZYE41 = 我的單詞教練(美)
++RZYF41 = 我的單詞教練(法)
++RZYP41 = 我的單詞教練(歐)
++RZYS41 = 我的單詞教練(西)
++RZZE8P = 瘋狂世界(美)
++RZZJEL = 瘋狂世界(日)
++RZZP8P = 瘋狂世界(歐)
++S02PES = 自制 唱吧 下載版(歐)
++S2TJAF = 太鼓達人Wii 咚咚與二代目(日)
++S3CENR = 三冠王滑雪錦標賽[平衡板](美)
++S3WEG9 = 家庭聚會 30大冬季游戲(美)
++S3WPG9 = 家庭聚會 30大冬季游戲(歐)
++S59JC8 = 戰國無雙3(日)
++S80U3Q = 自制 唱吧 下載版(歐)
++SABENR = 外星怪獸保齡球聯賽[MP](美)
++SALE4Q = 愛麗絲漫游仙境(美)
++SALP4Q = 愛麗絲漫游仙境(歐)
++SANT3Q = 自制 唱吧 下載版(歐)
++SAVE5G = 艾爾文與花栗鼠 明星俱樂部(美)
++SAVX5G = 艾爾文與金花鼠 明星俱樂部(歐)
++SAYP41 = 新兵訓練營學院(歐)
++SB2ES5 = 我寶寶的第一步(美)
++SB2PNP = 我的寶貝2[WiFi](歐)
++SBBJ18 = 金屬戰斗陀螺 對決大賽場(日)
++SBDE08 = 生化危機 暗黑編年史[WiFi](美)
++SBDJ08 = 生化危機 暗黑編年史[WiFi](日)
++SBDK08 = 生化危機 暗黑編年史[WiFi](韓)
++SBDP08 = 生化危機 暗黑編年史[WiFi](歐)
++SBFE70 = 后院橄欖球10(美)
++SBHEEP = 雷明頓美洲獵鳥記(美)
++SBHEFP = 雷明頓美洲獵鳥記(美)
++SBLE5G = 男孩與軟泥(美)
++SBLP5G = 男孩與軟泥(歐)
++SBNEG9 = BEN 10 外星神力 維爾加科斯的攻擊(美)
++SBNPG9 = BEN 10 外星神力 維爾加科斯的反擊(歐)
++SBOD3Q = 自制 唱吧 下載版(歐)
++SBVE78 = 海綿寶寶 碰碰船競速(美)
++SBVG3Q = 自制 唱吧 下載版(歐)
++SBZESZ = 百慕大三角 拯救珊瑚礁(美)
++SCAE18 = 鬼來電(美)
++SCAJ18 = 鬼鈴 黑暗來電(日)
++SCAP18 = 鬼來電(歐)
++SCBPNK = 自行車運動(歐)
++SCFPNK = 魔怪狂歡節(歐)
++SCNEA4 = 暮光之城(美)
++SCREJH = 鄉下小雞大暴亂(美)
++SCSE52 = 巡洋艦度假游戲[MP](美)
++SCTPNK = 小魔怪驚喜(歐)
++SDAE5G = 女孩們的勇敢游戲(美)
++SDNE41 = 舞夢成真(美)
++SDNP41 = 舞夢成真(歐)
++SDRP3Q = 自制 唱吧 下載版(歐)
++SDTH3Q = 自制 唱吧 下載版(歐)
++SEAE69 = EA運動活力 更多鍛煉[平衡板](美)
++SEAP69 = EA運動活力更多鍛煉[平衡板](歐)
++SEGE6U = 瑜伽[平衡板](美)
++SEGP6V = 瑜伽[平衡板](歐)
++SEOP4Q = 自制 唱吧 下載版(歐)
++SFAJGD = 鋼之煉金術師 黃昏少女(日)
++SFOEAF = 網絡食譜 烹飪對戰(美)
++SG2EFS = 瘋狂迷你高爾夫2(美)
++SG3DSV = 德國超模2010(德)
++SGCE20 = 冰川賽車2(美)
++SGDPKM = 花園一起玩(歐)
++SGI1CL = 自制 唱吧 下載版(歐)
++SGI1DB = 自制 唱吧 下載版(歐)
++SGI1MC = 自制 唱吧 下載版(歐)
++SGI1ML = 自制 唱吧 下載版(自)
++SGI1PT = 自制 唱吧 下載版(自)
++SGI1RC = 自制 唱吧 下載版(自)
++SGIJA4 = GTI汽車俱樂部 世界城市競速(日)
++SGJDSV = 神秘伽利略米達斯王冠(德)
++SGSP7J = 家庭游戲秀(歐)
++SH2JMS = 輕松學跳草裙舞(日)
++SHLPA4 = 寂靜嶺 破碎的記憶(歐)
++SHMPLR = 調皮的亨利(歐)
++SHOXKR = 雨果 巨魔樹林里的魔法(X)
++SHPE5G = 我們的家 聚會[WiFi](美)
++SIFESZ = 弗蘭克斯坦博士島(美)
++SILP4Q = 自制 唱吧 下載版(歐)
++SIS1OH = 自制 唱吧 下載版(歐)
++SIS2OH = 自制 唱吧 下載版(PAL)
++SIS3OH = 自制 唱吧 下載版(歐)
++SIS4OH = 自制 唱吧 下載版(PAL)
++SIS5OH = 自制 唱吧 下載版(歐)
++SIS7OH = 自制 唱吧 下載版(歐)
++SIS80Q = 自制 唱吧 下載版(歐)
++SIS90H = 自制 唱吧 下載版(歐)
++SIS9OH = 自制 唱吧 下載版(歐)
++SISAOH = 自制 唱吧 下載版(PAL)
++SISBOH = 自制 唱吧 下載版(歐)
++SISCOH = 自制 唱吧 下載版(歐)
++SISDOH = 自制 唱吧 下載版(歐)
++SISHOH = 自制 唱吧 下載版(歐)
++SISJ0Q = 骨盆瘦身[平衡板](日)
++SISLIP = 自制 唱吧 下載版(歐)
++SISLOH = 自制 唱吧 下載版(歐)
++SISMJ1 = 自制 唱吧 下載版(自)
++SISMOH = 自制 唱吧 下載版(歐)
++SISP10 = 自制 唱吧 下載版(歐)
++SISP12 = 自制 唱吧 下載版(歐)
++SISP34 = 自制 唱吧 下載版(歐)
++SISPOH = 自制 唱吧 下載版(歐)
++SISPOP = 自制 唱吧 下載版(歐)
++SISQ3Q = 自制 唱吧 下載版(歐)
++SISR3Q = 自制 唱吧 下載版(歐)
++SISRP4 = 自制 唱吧 下載版(歐)
++SISSOH = 自制 唱吧 下載版(歐)
++SISTDK = 迪斯尼 想唱就唱 土耳其聚會(歐)
++SJEEPK = JumpStart 逃離冒險島(美)
++SJME5G = 吉利安 麥克爾的健身訓練2010[平衡板](美)
++SJSEPK = 寵物營救(美)
++SKMJAF = 假面騎士 巔峰英雄W(日)
++SKREG9 = 假面騎士 龍騎士(美)
++SLPP5D = 狼的精神(歐)
++SLWE41 = 沃爾多在哪里？ 夢幻之旅(美)
++SM4E20 = 大腳怪物卡車大破壞(美)
++SMAENR = 海軍陸戰隊 現代城市戰(美)
++SMBE8P = 超級猴子球 平衡滾球[平衡板](美)
++SMBJ8P = 超級猴子球 平衡滾球[平衡板](日)
++SMBP8P = 超級猴子球 平衡滾球[平衡板](歐)
++SMCENR = 我們祝你圣誕快樂(美)
++SMIG3Q = 自制 唱吧 下載版(歐)
++SMLE54 = 職業棒球大聯盟2010(美)
++SMNE01 = 新超級馬里奧兄弟Wii(美)
++SMNJ01 = 新超級馬里奧兄弟Wii(日)
++SMNP01 = 新超級馬里奧兄弟Wii(歐)
++SMOT3Q = 自制 唱吧 下載版(歐)
++SMTJ18 = 桃太郎電鐵2010 戰國 維新英雄大集合！之卷(日)
++SMUJAF = 大怪獸格斗 終極競技場DX 終極戰士大集結(日)
++SN4JDA = 火影忍者疾風傳 龍刃記(日)
++SOKJ18 = 卡拉OK 歡樂之聲Wii DX(日)
++SP9P4Q = 自制 唱吧 下載版(歐)
++SPBPGT = 魅力聚會(歐)
++SPMDRM = 麻將聚會(德)
++SPPEFS = 力量拳擊(美)
++SPRE41 = 正確定價 2010版(美)
++SRAJMS = 電波少女諾亞Wii(日)
++SRBP4Q = 自制 唱吧 下載版(歐)
++SRMJ18 = Rooms 神秘的移動房間(日)
++SRNE70 = 天橋驕子(美)
++SRQE41 = 球拍運動[MP](美)
++SRRENR = 消遣游戲室[MP](美)
++SSCDWR = 電影場景猜猜 明亮的燈光與大屏幕(德)
++SSCEPM = 電影場景猜猜 明亮的燈光與大屏幕(美)
++SSCFPM = 電影場景猜猜 明亮的燈光與大屏幕(法)
++SSCFWR = 電影場景猜猜 明亮的燈光與大屏幕(法)
++SSCIWR = 電影場景猜猜 明亮的燈光與大屏幕(意)
++SSCPWR = 電影場景猜猜 明亮的燈光與大屏幕(歐)
++SSCSWR = 電影場景猜猜 明亮的燈光與大屏幕(西)
++SSGPNG = 我們唱歌[麥克風](歐)
++SSWDRM = 水上運動(德)
++SSWEPT = 水上運動[平衡板](美)
++SSWEPZ = 水上運動[平衡板](美)
++SSWPGR = 水上運動[平衡板](歐)
++ST8P75 = 自制 唱吧 下載版(歐)
++STAP75 = 自制 唱吧 下載版(歐)
++STCP75 = 自制 唱吧 下載版(歐)
++STDP75 = 自制 唱吧 下載版(歐)
++STGJAF = 圣恩傳說(日)
++STHP75 = 自制 唱吧 下載版(歐)
++STKE08 = 龍之子Vs.卡普空 究極全明星(美)
++STKJ08 = 龍之子Vs.卡普空 究極全明星(日)
++STKP08 = 龍之子Vs.卡普空 究極全明星(歐)
++STPP75 = 自制 唱吧 下載版(歐)
++STQP75 = 自制 唱吧 下載版(歐)
++STRP75 = 自制 唱吧 下載版(歐)
++STSP75 = 自制 唱吧 下載版(歐)
++STTE52 = 隱藏之謎 泰坦尼克秘密宿命之旅(美)
++SUMJC8 = 勝利賽馬世界2010(日)
++SUXEA4 = 實況足球2010[WiFi](美)
++SUXJA4 = 實況足球2010[WiFi](日)
++SUXPA4 = 實況足球2010[WiFi](歐)
++SUXXA4 = 實況足球2010[WiFi](X)
++SUXYA4 = 實況足球2010[WiFi](Y)
++SVPESZ = 維加斯聚會(美)
++SWAE52 = DJ英雄[WiFi](美)
++SWAP52 = DJ英雄[WiFi](歐)
++SXAE52 = 吉他英雄 世界巡演[WiFi](美)
++SXAP52 = 吉他英雄 世界巡演[WiFi](歐)
++SXBE52 = 吉他英雄 金屬樂隊專輯[WiFi](美)
++SXBP52 = 吉他英雄 金屬樂隊專輯[WiFi](歐)
++SXCE52 = 吉他英雄 流行精選[WiFi](美)
++SXCP52 = 吉他英雄 流行精選[WiFi](歐)
++SXDE52 = 吉他英雄 范海倫[WiFi](美)
++SXDP52 = 吉他英雄 范海倫[WiFi](歐)
++SXEE52 = 吉他英雄5[WiFi](美)
++SXEP52 = 吉他英雄5[WiFi](歐)
++SXFE52 = 樂團英雄[WiFi](美)
++SXFP52 = 樂團英雄[WiFi](歐)
++SZAE69 = 搖滾樂隊2[WiFi](美)
++SZAP69 = 搖滾樂隊2[WiFi](歐)
++W2CE = 腦力挑戰(美)
++W2CP = 腦力挑戰(歐)
++W2KE = 一起來接球(美)
++W2KP = 一起來接球(歐)
++WA2E = 大家的旋轉泡泡(美)
++WB5E = 豪華打磚塊(美)
++WB6P = 電視節目之王(歐)
++WBQP = 星際戰士R(歐)
++WBRP = 海盜 夢想的鑰匙(歐)
++WBSP = 夢幻泡沫(歐)
++WBVP = 輪胎賽車(歐)
++WBWE = 動物危機(美)
++WCOP = 小魔怪釣魚(歐)
++WDFE = 守衛城堡(美)
++WDME = 馬里奧醫生&細菌撲滅(美)
++WFCP = 小小國王與約定之國(歐)
++WGYE = 螺旋射擊(美)
++WKDE = 海盜 夢想的鑰匙(美)
++WKDP = 海盜 夢想的鑰匙(歐)
++WLWP = 迷失之風(歐)
++WPPE = 家庭乒乓球(美)
++WPQE = 鄰海空襲(美)
++WR9E = 洛克人9(美)
++WR9P = 洛克人9(歐)
++WTTE = 小雞快跑(美)
++WVCE = V.I.P 賭場:21點(美)
++XBKE52 = 自制 吉他英雄3 下載版(美)
++XNWE52 = 自制 吉它英雄3 Nightwish(美)
++#以下是為BOOK-MOD需要新增的頻道及WiiWare/VC/Forwarder等名稱
++JODI = HBC頻道
++HABA = 在線商店頻道(小心在線升級)
++HAGE = 新聞頻道
++HAFE = 氣象頻道
++HACA = Mii頻道
++HACE = Mii頻道
++HAYA = 照片頻道
++HAYE = 照片頻道
++WTPE = 俄羅斯方塊聚會
